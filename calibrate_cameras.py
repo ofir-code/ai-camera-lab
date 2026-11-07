@@ -252,6 +252,20 @@ def run_make_board(args):
     print(f'Saved: {pdf} (A4, exact scale - print at 100% / Actual size)\n       {png} (A4, 300 dpi)')
 
 
+def make_sensitive_detector(board):
+    """A board detector that also finds a small board seen at a steep angle (a camera far away / from the side)."""
+    params = cv2.aruco.DetectorParameters()
+    params.adaptiveThreshWinSizeMax = 53
+    params.minMarkerPerimeterRate = 0.005
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    cp = cv2.aruco.CharucoParameters()
+    cp.tryRefineMarkers = True
+    return cv2.aruco.CharucoDetector(board, cp, params)
+
+
+STATIC_BOARD_PX = 30.0     # the board moved less than this (median corner, px) -> it lay still: one position only
+
+
 def detect_board(detector, frame, min_corners=6):
     """Look for the calibration board in one video frame.
 
@@ -322,6 +336,7 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
     numbers of frames with the board, the fit errors, the check (reconstructed square size, reprojection
     error) and warnings."""
     board, detector = make_board()
+    sensitive = make_sensitive_detector(board)
     scale = square_mm / BOARD_SQUARE_MM          # the board's object points at the measured size (mm)
     board_xyz = board.getChessboardCorners().reshape(-1, 3) * scale
     srcs = [vs.VideoSource(video_a, hardware=True), vs.VideoSource(video_b, hardware=True)]
@@ -343,10 +358,11 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
             if frame is None:
                 continue
             small = cv2.resize(frame, None, fx=0.5, fy=0.5) if max(sizes[v]) > 2000 else frame
-            if detect_board(detector, small) is not None:     # quick check at half size first
-                d = detect_board(detector, frame)
-                if d is not None:
-                    seen[v][k] = d
+            d = detect_board(detector, frame) if detect_board(detector, small) is not None else None
+            if d is None:                                      # small / steep board: full size, sensitive detector
+                d = detect_board(sensitive, frame)
+            if d is not None:
+                seen[v][k] = d
         if progress and k % 4 == 0:
             progress((k + 1) / len(times), f'board seen in {len(seen[0])} (A) / {len(seen[1])} (B) frames')
         if should_stop and should_stop():
@@ -357,6 +373,14 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
         if len(seen[v]) < 10:
             raise ValueError(f'The board was found in only {len(seen[v])} frames of video {"AB"[v]} - need 10+ '
                              '(is it in view in that time window? is the offset right?).')
+
+    # Did the board move? If it lay still (e.g. on the table), each camera saw it in one position only - that
+    # can't tell a camera's lens: then one lens model shared by both cameras (same model and settings)
+    both = set(seen[0]) & set(seen[1])                 # the moments both cameras saw it
+    moved = [_board_movement({k: seen[v][k] for k in both}) for v in range(2)]
+    if len(both) >= 3 and max(moved) < STATIC_BOARD_PX:
+        return _calibrate_static_board([{k: seen[v][k] for k in both} for v in range(2)], board_xyz, sizes,
+                                       offset_s, times, square_mm, moved, warnings)
 
     # Each camera's lens (focal length, distortion) from its own board views (up to 60, spread over time)
     cams, lens_rms = [], []
@@ -415,7 +439,67 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
         warnings.append(f"The squares come out {res['square_mean_mm']:.1f} mm instead of {square_mm:.1f} mm.")
     res['warnings'] = warnings
     res['ok'] = not warnings
+    res['method'] = 'board (moving)'
     return res
+
+
+def _board_movement(seen):
+    """How far the board moved over the views (median over corners of the largest corner displacement, px)."""
+    pos = {}
+    for c, ids in seen.values():
+        for p, i in zip(c, ids):
+            pos.setdefault(int(i), []).append(p)
+    spans = [np.ptp(np.array(v), axis=0).max() for v in pos.values() if len(v) >= 3]
+    return float(np.median(spans)) if spans else 0.0
+
+
+def _calibrate_static_board(seen, board_xyz, sizes, offset_s, times, square_mm, moved, warnings):
+    """The board lay still: each camera's board position from the median of its views, one lens shared by both
+    cameras (focal length fitted, image centre, no distortion - GoPro Linear lens), and from the two board
+    positions where camera B is. Less exact than a moving board."""
+    obj, img, ids_v = [], [], []
+    for v in range(2):
+        pos = {}
+        for c, ids in seen[v].values():
+            for p, i in zip(c, ids):
+                pos.setdefault(int(i), []).append(p)
+        need = max(3, len(seen[v]) // 2)
+        ids = sorted(i for i, p in pos.items() if len(p) >= need)
+        if len(ids) < 6:
+            raise ValueError(f'The board was seen too rarely in video {"AB"[v]} to calibrate.')
+        obj.append(board_xyz[ids].astype(np.float32))
+        img.append(np.float32([np.median(pos[i], axis=0) for i in ids]))
+        ids_v.append(ids)
+    flags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT | cv2.CALIB_FIX_ASPECT_RATIO |
+             cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3)
+    K0 = K_matrix(0.53 * max(sizes[0]), sizes[0])                # ~ GoPro Linear 4K
+    rms, K, _, rv, tv = cv2.calibrateCamera(obj, img, sizes[0], K0, np.zeros(5), flags=flags)
+    Ra, Rb = cv2.Rodrigues(rv[0])[0], cv2.Rodrigues(rv[1])[0]
+    ta, tb = tv[0].ravel(), tv[1].ravel()
+    R, t = Rb @ Ra.T, tb - Rb @ Ra.T @ ta
+    lens_rms = []
+    for v, (Rv, tvv) in enumerate(((Ra, ta), (Rb, tb))):
+        e = np.linalg.norm(project(obj[v], K, np.zeros(5), Rv, tvv) - img[v], axis=1)
+        lens_rms.append(float(np.sqrt(np.mean(e ** 2))))
+    common = sorted(set(ids_v[0]) & set(ids_v[1]))
+    pa = np.float32([img[0][ids_v[0].index(i)] for i in common])
+    pb = np.float32([img[1][ids_v[1].index(i)] for i in common])
+    X = triangulate_px(pa, pb, K, K, R, t)
+    pos = dict(zip(common, X))
+    sq = np.array([np.linalg.norm(pos[i] - pos[j]) for i, j in _grid_neighbors(common)])
+    reproj = np.concatenate([np.linalg.norm(project(X, K, np.zeros(5), np.eye(3), np.zeros(3)) - pa, axis=1),
+                             np.linalg.norm(project(X, K, np.zeros(5), R, t) - pb, axis=1)])
+    cams = [dict(K=K, dist=np.zeros(5), size=sizes[0]), dict(K=K, dist=np.zeros(5), size=sizes[1])]
+    warnings = warnings + [
+        f'The board lay still while both cameras saw it ({len(seen[0])} moments, it moved {max(moved):.0f} px at '
+        'most), so they saw it in one position only: one lens model shared by both cameras is assumed. 3D is less '
+        'exact - next time hold the board and slowly tilt and move it for 20-30 s where both cameras see it.']
+    return dict(cameras=cams, R=R, t_cm=t / 10, frames_a=len(seen[0]), frames_b=len(seen[1]),
+                frames_both=len(set(seen[0]) & set(seen[1])), lens_rms_px=lens_rms, stereo_rms_px=float(rms),
+                distance_cm=float(np.linalg.norm(t) / 10), square_mm=float(square_mm),
+                square_mean_mm=float(sq.mean()), square_sd_mm=float(sq.std()), reprojection_px=float(reproj.mean()),
+                offset_s=float(offset_s), sample_window_s=[float(times[0]), float(times[-1])],
+                warnings=warnings, ok=False, method='board (one position, shared lens)', focal_px=float(K[0, 0]))
 
 
 def save_board_calibration(path, res, video_a, video_b):
@@ -426,7 +510,7 @@ def save_board_calibration(path, res, video_a, video_b):
     Returns: nothing.
     """
     ca, cb = res['cameras']
-    save_cameras(path, ca, cb, res['R'], res['t_cm'], 'cm', 'board',
+    save_cameras(path, ca, cb, res['R'], res['t_cm'], 'cm', res.get('method', 'board'),
                  dict(video_a=os.path.abspath(video_a), video_b=os.path.abspath(video_b),
                       **{k: res[k] for k in ('frames_a', 'frames_b', 'frames_both', 'lens_rms_px', 'stereo_rms_px',
                                              'distance_cm', 'square_mm', 'square_mean_mm', 'square_sd_mm',
@@ -440,7 +524,8 @@ def board_report(res):
     Returns: several lines of text: how many frames had the board, fit errors, distance between the cameras,
     the size check of the squares, and PASS or the warnings.
     """
-    lines = [f"Board found in {res['frames_a']} frames of A, {res['frames_b']} of B, {res['frames_both']} of both.",
+    lines = [f"Method: {res.get('method', 'board')}.",
+             f"Board found in {res['frames_a']} frames of A, {res['frames_b']} of B, {res['frames_both']} of both.",
              f"Lens fit error: A {res['lens_rms_px'][0]:.2f} px, B {res['lens_rms_px'][1]:.2f} px; "
              f"stereo fit error {res['stereo_rms_px']:.2f} px.",
              f"Cameras are {res['distance_cm']:.1f} cm apart.",

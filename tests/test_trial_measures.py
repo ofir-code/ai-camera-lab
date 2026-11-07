@@ -89,8 +89,9 @@ class Measures(unittest.TestCase):
         # The exact values of the current method (regression: any change of the method shows here)
         self.assertAlmostEqual(m['responsetime'], 0.28, places=6)
         self.assertAlmostEqual(m['movementtime'], 0.45, places=6)
-        self.assertAlmostEqual(m['AT'], 0.23, places=6)
-        self.assertAlmostEqual(m['DT'], 0.22, places=6)
+        # The speed peak is two equal samples here, so which one wins can differ by platform: AT is 0.22 or 0.23
+        self.assertAlmostEqual(m['AT'], 0.225, delta=0.0051)
+        self.assertAlmostEqual(m['AT'] + m['DT'], 0.45, places=6)
         self.assertAlmostEqual(m['endpointdistance'], 0.244978, places=5)
 
     def test_rt_follows_the_light(self):

@@ -14,6 +14,9 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# The reference frames are decoded by FFmpeg; the engine must use the same decoder for values to match exactly
+# (the Mac hardware decoder gives slightly different pixels). Set before the engine starts its workers.
+os.environ['LAB_HW_DECODE'] = '0'
 import extract_kinematics as ek  # noqa: E402
 import session_engine as se  # noqa: E402
 
