@@ -1,7 +1,7 @@
 """Where two cameras are relative to each other (and their lens settings), for 3D in the Lab App.
 
-The calibration itself is done in the Lab App (Session step: calibrate with the board, or by clicking matching
-points). This file holds the maths, and prints the calibration board:
+The calibration itself runs in the Lab App (step 2, Calibration: the ChArUco board filmed by both cameras at the start
+of the session, or in separate clips). This file holds the maths, and prints the calibration board:
 
     venv/bin/python calibrate_cameras.py make-board
     (outputs/charuco_board.pdf and .png; print the PDF at 100% / actual size on A4, glue it to something flat,
@@ -13,7 +13,6 @@ import os
 
 import cv2
 import numpy as np
-from scipy.optimize import least_squares
 
 import video_source as vs
 
@@ -69,51 +68,6 @@ def K_matrix(f, size):
 # -----------------------------
 # Clicks
 # -----------------------------
-def calibrate_from_points(pa, pb, size_a, size_b, f_a, f_b, refine_focal=None):
-    """Relative pose (R, t with |t| = 1) and focal lengths from matched points, plus the 3D points and
-    the reprojection errors (px)."""
-    n = len(pa)
-    if refine_focal is None:
-        refine_focal = n >= 20
-    na = (pa - np.array(size_a) / 2) / f_a
-    nb = (pb - np.array(size_b) / 2) / f_b
-    E, mask = cv2.findEssentialMat(na, nb, np.eye(3), method=cv2.LMEDS)
-    best = None
-    for Ei in E.reshape(-1, 3, 3):  # the 5-point method can return several solutions
-        good, R, t, _ = cv2.recoverPose(Ei, na, nb, np.eye(3))
-        if best is None or good > best[0]:
-            best = (good, R, t.ravel())
-    _, R, t = best
-
-    def unpack(p):  # one focal scale shared by both cameras (similar lenses): steadier with few points
-        """Turn the optimizer's flat list of numbers back into named pieces.
-
-        Input: p - the list of numbers being adjusted (focal scale, rotation, direction of camera B, 3D points).
-        Returns: (focal A, focal B, rotation of B, unit direction of B, the 3D points).
-        """
-        fa, fb = (f_a * p[0], f_b * p[0]) if refine_focal else (f_a, f_b)
-        q = p[1:] if refine_focal else p
-        return fa, fb, cv2.Rodrigues(q[:3])[0], q[3:6] / np.linalg.norm(q[3:6]), q[6:].reshape(n, 3)
-
-    def residuals(p):
-        """How far off the current guess is: for every clicked point, the gap (pixels) between where the guess
-        says the point should appear in each camera and where it was actually clicked.
-
-        Input: p - the current guess (see unpack). Returns: one flat array of all the gaps (x and y, both cameras).
-        """
-        fa, fb, Rb, tb, X = unpack(p)
-        ra = project(X, K_matrix(fa, size_a), np.zeros(5), np.eye(3), np.zeros(3)) - pa
-        rb = project(X, K_matrix(fb, size_b), np.zeros(5), Rb, tb) - pb
-        return np.concatenate([ra.ravel(), rb.ravel()])
-
-    X0 = triangulate_px(pa, pb, K_matrix(f_a, size_a), K_matrix(f_b, size_b), R, t)
-    p0 = np.concatenate([[1.0] if refine_focal else [], cv2.Rodrigues(R)[0].ravel(), t, X0.ravel()])
-    res = least_squares(residuals, p0, x_scale='jac', loss='soft_l1', f_scale=5.0)
-    fa, fb, R, t, X = unpack(res.x)
-    err = np.hypot(*res.fun.reshape(2, n, 2).transpose(2, 0, 1)).max(axis=0)
-    return fa, fb, R, t, X, err
-
-
 def project(X, K, dist, R, t):
     """Where 3D points appear in a camera's picture.
 
