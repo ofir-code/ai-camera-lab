@@ -265,6 +265,8 @@ class TestRun(Base):
         st = pl.load_day('S01', 'd1')
         pl.set_status(st, 'videos', pl.STATUS_RUNNING)
         pl.save_day(st)
+        self.assertEqual(pl.load_day('S01', 'd1')['steps']['videos']['status'], 'running')   # while it runs
+        pl.recover_interrupted()                                                              # at start-up
         self.assertEqual(pl.load_day('S01', 'd1')['steps']['videos']['status'], 'todo')
 
 

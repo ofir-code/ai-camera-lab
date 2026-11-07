@@ -42,7 +42,7 @@ STATUS_TODO, STATUS_RUNNING, STATUS_OK, STATUS_WARN, STATUS_ERROR, STATUS_SKIPPE
 DONE = (STATUS_OK, STATUS_WARN, STATUS_SKIPPED)
 
 # Where the automatic steps look (seconds into camera A's video)
-CALIB_WINDOWS = ((0.0, 180.0), (180.0, 420.0))      # the board is filmed at the start of the session
+CALIB_WINDOWS = ((0.0, 180.0), (180.0, 240.0))      # the board is filmed at the start of the session
 CALIB_PER_SECOND = 2.0
 SWITCH_WINDOWS = ((0.0, 5.0), (5.0, 5.0))           # (from minute, for minutes): the first trials light them up
 
@@ -209,9 +209,24 @@ def load_day(pid, day, results_dir=None):
         st['steps'] = _infer_steps(st, folder)
     for s in STEPS:
         st['steps'].setdefault(s, _status(STATUS_TODO))
-        if st['steps'][s]['status'] == STATUS_RUNNING:      # the app was closed while it ran
-            st['steps'][s] = _status(STATUS_TODO, 'It was stopped before it finished.')
     return st
+
+
+def recover_interrupted(results_dir=None):
+    """At start-up: a step still marked running was cut off (the app or computer was closed) - to-do again."""
+    for pid in list_participants(results_dir):
+        for day in DAYS:
+            try:
+                if not day_exists(pid, day, results_dir):
+                    continue
+                st = load_day(pid, day, results_dir)
+            except (ValueError, OSError):
+                continue
+            hit = [s for s in STEPS if st['steps'][s]['status'] == STATUS_RUNNING]
+            for s in hit:
+                st['steps'][s] = _status(STATUS_TODO, 'It was stopped before it finished.')
+            if hit:
+                save_day(st, results_dir)
 
 
 def save_day(st, results_dir=None):
@@ -427,6 +442,9 @@ def step_calibration(st, progress, should_stop, results_dir=None):
     if not st.get('cam_b'):
         st['calibration'] = ''
         return STATUS_SKIPPED, 'One camera - no calibration needed (2D).', []
+    if st.get('calibration_source') == 'none':
+        st['calibration'] = ''
+        return STATUS_SKIPPED, 'No 3D - each camera is analysed in 2D (chosen).', []
     if st.get('calibration_source') == 'file':
         path = st.get('calibration')
         if not path or not os.path.exists(path):
@@ -442,30 +460,44 @@ def step_calibration(st, progress, should_stop, results_dir=None):
         lines += [f'! {w}' for w in meta.get('warnings') or []]
         return STATUS_OK, 'Calibration from a file (cameras not moved since).', lines
     c = st.get('calib') or {}
-    windows = ([(c['start_s'], c['seconds'])] if c.get('start_s') is not None and c.get('seconds')
-               else list(CALIB_WINDOWS))
+    va, vb, offset = st['cam_a'], st['cam_b'], st.get('offset_s', 0.0)
+    if st.get('calibration_source') == 'clips':
+        # The board filmed in separate clips (same camera positions), lined up by their own timecodes
+        import timecode
+        va, vb = st['calib_clips']
+        for v in (va, vb):
+            if not os.path.exists(v):
+                raise FileNotFoundError(f'The board clip is not there: {v}')
+        offset = timecode.timecode_offset(va, vb)[0]
+        windows = [(0.0, None)]
+    elif c.get('start_s') is not None and c.get('seconds'):
+        windows = [(c['start_s'], c['seconds'])]
+    else:
+        windows = list(CALIB_WINDOWS)
     errors = []
     for k, (start, length) in enumerate(windows):
         if should_stop():
             raise Stopped()
+        where = 'the board clips' if length is None else f'{start / 60:.0f}-{(start + length) / 60:.0f} min'
         try:
-            res = cc.calibrate_board(st['cam_a'], st['cam_b'], st.get('offset_s', 0.0), st.get('square_mm', 38.0),
-                                     start, length, CALIB_PER_SECOND,
+            res = cc.calibrate_board(va, vb, offset, st.get('square_mm', 38.0), start, length, CALIB_PER_SECOND,
                                      progress=lambda f, t='': progress((k + f) / len(windows), t),
                                      should_stop=should_stop)
         except ValueError as e:
             if should_stop():
                 raise Stopped()
-            errors.append(f'{start / 60:.0f}-{(start + length) / 60:.0f} min: {e}')
+            errors.append(f'{where}: {e}')
             continue
         path = os.path.join(day_dir(st['subject'], st['session'], results_dir), 'cameras_board.json')
-        cc.save_board_calibration(path, res, st['cam_a'], st['cam_b'])
+        cc.save_board_calibration(path, res, va, vb)
         st['calibration'] = path
-        details = [f'Board searched {start / 60:.0f}-{(start + length) / 60:.0f} min.'] + cc.board_report(res).splitlines()
+        details = [f'Board searched in {where}.'] + cc.board_report(res).splitlines()
         if res['ok']:
             return STATUS_OK, f'3D: cameras {res["distance_cm"]:.0f} cm apart, squares {res["square_mean_mm"]:.1f} mm.', details
         return STATUS_WARN, f'3D with warnings: cameras {res["distance_cm"]:.0f} cm apart.', details
     st['calibration'] = ''
+    if st.get('calibration_source') == 'clips':
+        raise ValueError('The board was not found in the clips.\n' + '\n'.join(errors))
     return (STATUS_WARN, 'The board was not found - each camera is analysed in 2D. Set the time window where the '
             'board is filmed, or use the calibration file of an earlier recording.', errors)
 
@@ -704,6 +736,7 @@ def main():
         items = [(args[0], d) for d in ((args[1],) if len(args) > 1 else DAYS) if day_exists(args[0], d)]
     else:
         items = queue_items()
+    recover_interrupted()
     print(f'{len(items)} day(s) to run: ' + ', '.join(f'{p}/{d}' for p, d in items))
 
     def show(i, pid, day, step, f, text):
