@@ -78,7 +78,7 @@ def template_of(state):
     """
     d = state['design']
     return ed.session_template(d['tested_side'], d['contralateral'], d['practice_limb'], d['practice_side'],
-                               d.get('retest', False))
+                               d.get('retest', False), d.get('familiarization', 'practice'))
 
 
 def settings_of(state):
@@ -195,12 +195,18 @@ class Session:
         """
         st = self.state
         n = len(self.times)
-        events = []
+        events, noisy, noisy_names = [], [], []
         for c, cache in self.cams.items():
             ev = [(s, self.to_master(c, on) if on > 0 else 0, None if off is None else self.to_master(c, off))
                   for s, on, off in ed.light_events(cache['light'], cache['meta']['fps'])]
+            # A view of a switch that flickers is used only inside the blocks the reliable views find
+            bad = ed.noisy_switches(ev, self.times)
+            noisy_names += [f'switch {s} in camera {c.upper()}' for s in sorted(bad)]
+            noisy = ed.merge_camera_events(noisy, [e for e in ev if e[0] in bad], self.fps)
+            ev = [e for e in ev if e[0] not in bad]
             # A light 'still on' at the end of a camera that stopped early isn't a light still on in the session
             events = ev if not events else ed.merge_camera_events(events, ev, self.fps)
+        events = ed.combine_noisy(events, noisy, self.times, self.fps, settings_of(st))
         touch = {}
         for limb in ('upper', 'lower'):
             arrs = [self.per_frame(c, cache[f'touch_{limb}'].T) for c, cache in self.cams.items()]
@@ -208,6 +214,8 @@ class Session:
         template = template_of(st)
         res = ed.analyze_session(events, self.times, self.fps, touch, template, settings_of(st),
                                  st.get('parts_override'))
+        if noisy_names:
+            res['warnings'].append('Flickering light (used only inside blocks): ' + ', '.join(noisy_names) + '.')
         if len(self.cams) == 2:
             (a0, a1), (b0, b1) = self.coverage['a'], self.coverage['b']
             for name, (x0, x1), other in (('A', (a0, a1), (b0, b1)), ('B', (b0, b1), (a0, a1))):

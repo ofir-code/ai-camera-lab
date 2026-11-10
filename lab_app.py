@@ -96,7 +96,12 @@ class ParticipantDialog(QtWidgets.QDialog):
             prow.addWidget(QtWidgets.QLabel(lab))
             prow.addWidget(w)
         prow.addStretch()
-        f.addRow('Practice (and familiarization)', prow)
+        f.addRow('Practice', prow)
+        self.c_fam = QtWidgets.QComboBox()
+        self.c_fam.addItems(['with the practice limb', 'with the tested arm'])
+        self.c_fam.setCurrentIndex(1 if d.get('familiarization') == 'test' else 0)
+        self.c_fam.currentIndexChanged.connect(self.update_plan)
+        f.addRow('Familiarization', self.c_fam)
         self.l_plan = QtWidgets.QLabel()
         self.l_plan.setWordWrap(True)
         f.addRow('Plan', self.l_plan)
@@ -173,7 +178,8 @@ class ParticipantDialog(QtWidgets.QDialog):
 
     def design(self):
         return dict(tested_side=self.c_tested.currentText(), contralateral=self.k_contra.isChecked(),
-                    practice_limb=self.c_plimb.currentText(), practice_side=self.c_pside.currentText())
+                    practice_limb=self.c_plimb.currentText(), practice_side=self.c_pside.currentText(),
+                    familiarization='test' if self.c_fam.currentIndex() == 1 else 'practice')
 
     def settings(self):
         base = dict((self.p or {}).get('settings') or vars(ed.Settings()))
@@ -187,8 +193,9 @@ class ParticipantDialog(QtWidgets.QDialog):
         lines = []
         for day in pl.DAYS:
             parts = ed.session_template(d['tested_side'], d['contralateral'], d['practice_limb'], d['practice_side'],
-                                        day != 'd1')
-            lines.append(f'<b>{pl.DAY_NAMES[day]}</b>: ' + ' → '.join(f'{p.name} ({p.blocks})' for p in parts)
+                                        day != 'd1', d['familiarization'])
+            lines.append(f'<b>{pl.DAY_NAMES[day]}</b>: ' + ' → '.join(
+                f'{p.name} ({p.blocks}, {"arm" if p.limb == "upper" else "leg"})' for p in parts)
                          + f' = {sum(p.blocks for p in parts)} blocks')
         self.l_plan.setText('<br>'.join(lines))
 
@@ -921,7 +928,8 @@ class LabApp(QtWidgets.QMainWindow):
         self.l_head.setText(
             f'<span style="font-size:16pt"><b>{pid}</b></span>&nbsp;&nbsp; tested arm <b>{d["tested_side"]}</b>'
             + (' + contralateral' if d['contralateral'] else '')
-            + f', practice <b>{d["practice_limb"]} {d["practice_side"]}</b>')
+            + f', practice <b>{d["practice_limb"]} {d["practice_side"]}</b>'
+            + (', familiarization with the tested arm' if d.get('familiarization') == 'test' else ''))
         for dv in self.days.values():
             dv.set_participant(pid)
             dv.set_busy(self.running() and self.runner.current == (pid, dv.day))

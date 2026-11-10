@@ -60,6 +60,11 @@ class Template(unittest.TestCase):
         self.assertEqual([p.name for p in t], ['Familiarization', 'pre_test', 'pre_test_contralateral', 'practice',
                                                'post_test', 'post_test_contralateral'])
         self.assertEqual((t[2].side, t[3].limb, t[3].side), ('right', 'lower', 'left'))
+        self.assertEqual((t[0].limb, t[0].side), ('lower', 'left'))           # familiarization: practice limb
+        t = ed.session_template('right', practice_limb='lower', practice_side='left', familiarization='test')
+        self.assertEqual([(p.name, p.blocks, p.limb, p.side) for p in t],
+                         [('Familiarization', 2, 'upper', 'right'), ('pre_test', 3, 'upper', 'right'),
+                          ('practice', 10, 'lower', 'left'), ('post_test', 3, 'upper', 'right')])
         self.assertEqual([p.name for p in ed.session_template(retest=True, contralateral=True)],
                          ['re_test', 're_test_contralateral'])
 
@@ -228,6 +233,46 @@ class Session(unittest.TestCase):
         self.assertEqual(res['trials'][0]['Outcome'], 'unknown')
         self.assertIsNone(res['trials'][0]['Light_on_ms'])
         self.assertEqual(res['trials'][-1]['Outcome'], 'unknown')
+
+
+class TestNoisyLights(unittest.TestCase):
+    """A view of a switch that flickers (e.g. something moving near it) must not join blocks across a pause."""
+
+    def make(self):
+        fps = 50.0
+        times = np.arange(0, 200 * fps) * 1000 / fps
+        f = lambda sec: int(sec * fps)
+        pattern = [1, 4, 3, 5, 4, 2]
+        trusted = []
+        for start in (10, 110):                           # two blocks of 30 trials, 2 s apart, a long pause between
+            for k in range(30):
+                t0 = start + 2 * k
+                trusted.append((pattern[k % 6], f(t0), f(t0 + 0.5)))
+        # switch 2 flickers in one view: bursts during the blocks and all through the pause
+        noisy = [(2, f(x), f(x + 0.1)) for x in list(np.arange(12, 60, 0.7)) + list(np.arange(68.5, 108, 0.4))]
+        return fps, times, trusted, noisy
+
+    def test_noisy_switches(self):
+        fps, times, trusted, noisy = self.make()
+        self.assertEqual(ed.noisy_switches(trusted + noisy, times), {2})
+        self.assertEqual(ed.noisy_switches(trusted, times), set())
+
+    def test_pause_not_bridged(self):
+        fps, times, trusted, noisy = self.make()
+        st = ed.Settings()
+        bad = sorted(trusted + noisy, key=lambda e: e[1])
+        self.assertEqual(len(ed.split_blocks(bad, times, st)), 1)           # the flicker joins the two blocks
+        good = ed.combine_noisy(sorted(trusted, key=lambda e: e[1]), noisy, times, fps, st)
+        blocks = ed.split_blocks(good, times, st)
+        self.assertEqual(len(blocks), 2)
+        self.assertFalse(any(75 * fps <= e[1] <= 104 * fps for e in good))  # flicker in the pause dropped
+
+    def test_lone_lights_dropped(self):
+        fps, times, trusted, _ = self.make()
+        lone = [(1, int(90 * fps), int(90.3 * fps))]
+        kept, n = ed.drop_lone_events(sorted(trusted + lone, key=lambda e: e[1]), times)
+        self.assertEqual(n, 1)
+        self.assertEqual(len(kept), len(trusted))
 
 
 if __name__ == '__main__':

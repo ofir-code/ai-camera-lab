@@ -46,7 +46,8 @@ CALIB_WINDOWS = ((0.0, 180.0), (180.0, 240.0))      # the board is filmed at the
 CALIB_PER_SECOND = 2.0
 SWITCH_WINDOWS = ((0.0, 5.0), (5.0, 5.0))           # (from minute, for minutes): the first trials light them up
 
-DESIGN_DEFAULT = dict(tested_side='right', contralateral=False, practice_limb='upper', practice_side='right')
+DESIGN_DEFAULT = dict(tested_side='right', contralateral=False, practice_limb='upper', practice_side='right',
+                      familiarization='practice')     # familiarization with the practice limb, or 'test': tested arm
 
 
 class Stopped(Exception):
