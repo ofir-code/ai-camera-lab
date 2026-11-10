@@ -27,6 +27,10 @@ IGNORE = '(ignore)'
 
 @dataclass
 class Settings:
+    """The numbers that describe the experiment's design (how many trials per sequence, sequences per block,
+    how long a pause separates blocks, how long a light stays on, etc.). Each field has its meaning written next
+    to it. The Lab App saves these with the session, so they can be changed per session.
+    """
     trials_per_sequence: int = 6
     sequences_per_block: int = 5
     block_gap_s: float = 10.0        # a pause longer than this between two lights starts a new block
@@ -39,6 +43,11 @@ class Settings:
 
 @dataclass
 class Part:
+    """One part of a session, e.g. "pre_test".
+
+    Fields: name - the part's name; blocks - how many blocks it has; limb - 'upper' (hand) or 'lower' (foot);
+    side - 'right' or 'left'.
+    """
     name: str
     blocks: int
     limb: str     # 'upper' / 'lower'
@@ -46,15 +55,18 @@ class Part:
 
 
 def session_template(tested_side='right', contralateral=False, practice_limb='upper', practice_side=None,
-                     retest=False):
-    """The parts of a session in order (the user can edit them)."""
+                     retest=False, familiarization='practice'):
+    """The parts of a session in order (the user can edit them). familiarization: 'practice' = with the practice
+    limb, 'test' = with the tested arm."""
     other = 'left' if tested_side == 'right' else 'right'
     practice_side = practice_side or tested_side
     test = lambda name: [Part(name, 3, 'upper', tested_side)] + (
         [Part(f'{name}_contralateral', 3, 'upper', other)] if contralateral else [])
     if retest:
         return test('re_test')
-    return ([Part('Familiarization', 2, practice_limb, practice_side)] + test('pre_test')
+    fam = (Part('Familiarization', 2, 'upper', tested_side) if familiarization == 'test'
+           else Part('Familiarization', 2, practice_limb, practice_side))
+    return ([fam] + test('pre_test')
             + [Part('practice', 10, practice_limb, practice_side)] + test('post_test'))
 
 
@@ -73,7 +85,8 @@ def light_events(light, fps):
 
 def merge_camera_events(ev_a, ev_b, fps, max_gap_s=0.2):
     """Events of the same switches seen by two cameras (frames on camera A's clock) -> one list. Seen by
-    both: earliest on, latest off (a hand over the LED can only make a light look off in one view)."""
+    both: earliest on, latest off (a hand over the LED can only make a light look off in one view). A light
+    still on at the end in one view (off None) gets the other camera's off (one camera may stop earlier)."""
     out, used = [], set()
     for s, on, off in ev_a:
         k = next((i for i, (s2, on2, _) in enumerate(ev_b)
@@ -90,6 +103,36 @@ def merge_camera_events(ev_a, ev_b, fps, max_gap_s=0.2):
         out.append((s, on_m, off_m))
     out += [e for i, e in enumerate(ev_b) if i not in used]
     return sorted(out, key=lambda e: e[1])
+
+
+NOISY_BURST_FRACTION = 0.2    # a view of a switch with more of its 'lights' this close together is flicker
+NOISY_BURST_S = 1.5           # the same switch never lights twice within this time (a trial + the 1 s delay)
+
+
+def noisy_switches(events, times_ms):
+    """The switches whose light, in this camera's view, flickers: more than NOISY_BURST_FRACTION of its events
+    come within NOISY_BURST_S of the previous one (a real light can't: the next trial lights another switch).
+    Typically something moving near the switch (a leg, a person in the background, red tape). Returns a set."""
+    out = set()
+    for s in {e[0] for e in events}:
+        on = np.array([times_ms[e[1]] / 1000 for e in events if e[0] == s and e[1] > 0])
+        if len(on) >= 20 and np.mean(np.diff(on) < NOISY_BURST_S) > NOISY_BURST_FRACTION:
+            out.add(s)
+    return out
+
+
+def combine_noisy(trusted, noisy, times_ms, fps, settings, margin_s=3.0):
+    """Lights of flickering views are used only within the blocks found from the reliable views (so flicker in
+    the pauses can't join two blocks), merged with the reliable lights of the same switch."""
+    if not noisy:
+        return trusted
+    if len({e[0] for e in trusted}) < 3:          # too little is reliable: use everything
+        return merge_camera_events(trusted, noisy, fps)
+    kept, _ = drop_lone_events(trusted, times_ms)
+    spans = [(times_ms[kept[b[0]][1]] - margin_s * 1000, times_ms[kept[b[-1]][1]] + margin_s * 1000)
+             for b in split_blocks(kept, times_ms, settings)]
+    inside = [e for e in noisy if any(a <= times_ms[e[1]] <= z for a, z in spans)]
+    return merge_camera_events(trusted, inside, fps)
 
 
 def inter_trial_delay(events, times_ms):
@@ -124,6 +167,25 @@ def _hidden_end(touch_any, s, on, fps, settings, limit):
         seg &= ~(rows[:, on:on + 1] <= ek.TOUCH_DIST)     # not the switch it was already touching
     hit = np.nonzero(seg.any(axis=0))[0]
     return on + int(hit[0]) if len(hit) else stop
+
+
+LONE_WINDOW_S = 5.0     # a real light has a light of another switch within this time (the trial before / after)
+
+
+def drop_lone_events(events, times_ms, window_s=LONE_WINDOW_S):
+    """Remove 'lights' with no light of another switch within window_s before or after them. In a block the
+    next trial always lights another switch about 2 s later, so a lone light is noise - e.g. a flicker in one
+    camera's view during the pause between blocks, which would otherwise join two blocks into one. Only when at
+    least 3 switches' lights are seen (with fewer, a lone light may just be the only visible one).
+    Returns (kept events, number removed)."""
+    if len({e[0] for e in events}) < 3:
+        return events, 0
+    t = np.array([times_ms[e[1]] / 1000 for e in events])
+    keep = []
+    for i, e in enumerate(events):
+        lo, hi = np.searchsorted(t, t[i] - window_s), np.searchsorted(t, t[i] + window_s, side='right')
+        keep.append(e[1] <= 0 or any(events[j][0] != e[0] for j in range(lo, hi) if j != i))
+    return [e for e, k in zip(events, keep) if k], len(events) - sum(keep)
 
 
 def fill_hidden_lights(events, times_ms, fps, touch_any, settings):
@@ -350,6 +412,10 @@ def analyze_session(light, times_ms, fps, touch, template, settings, parts_overr
         warnings.append(f'The typed switch order {settings.pattern} is ignored ({problem}) - it is found from the '
                         'lights instead. Type it as e.g. 1,4,3,5,4,2.')
     touch_any = np.minimum(touch['upper'], touch['lower'])
+    events, n_lone = drop_lone_events(events, times_ms)
+    if n_lone:
+        warnings.append(f'{n_lone} light(s) with no other light near them in time were left out (noise, e.g. a '
+                        'flicker in one camera during a pause).')
     events, delay = fill_hidden_lights(events, times_ms, fps, touch_any, settings)
     blocks = split_blocks(events, times_ms, settings)
     parts, w = assign_parts(blocks, template, settings)

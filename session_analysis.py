@@ -14,10 +14,10 @@ import json
 import os
 from dataclasses import asdict
 
-import cv2
 import numpy as np
 
 import experiment_design as ed
+import extract_kinematics as ek
 import session_engine as se
 import trial_measures as tm
 
@@ -26,6 +26,12 @@ RESULTS_DIR = os.path.join(PROJECT_DIR, 'results')
 
 
 def default_state(subject='S01', session='d1'):
+    """The settings of a brand-new session, before the user fills anything in.
+
+    Inputs: subject - subject code (e.g. 'S01'); session - session name ('d1' = day 1; any other name is
+    treated as a re-test day).
+    Returns: a dict with every session setting (videos, offset, calibration, switch boxes, design, ...).
+    """
     return dict(subject=subject, session=session, cam_a='', cam_b='', offset_s=0.0, calibration='',
                 boxes_a=None, boxes_b=None,
                 design=dict(tested_side='right', contralateral=False, practice_limb='upper',
@@ -35,10 +41,19 @@ def default_state(subject='S01', session='d1'):
 
 
 def session_dir(state):
+    """The folder where a session's files are kept: results/<subject>/<session>.
+
+    Input: state - the session's settings (a dict). Returns: the folder path.
+    """
     return os.path.join(RESULTS_DIR, state['subject'], state['session'])
 
 
 def load_state(folder):
+    """Open a saved session: read <folder>/session.json.
+
+    Input: folder - the session folder.
+    Returns: the session's settings (a dict); settings missing from the file get their default values.
+    """
     with open(os.path.join(folder, 'session.json')) as f:
         s = default_state()
         s.update(json.load(f))
@@ -46,6 +61,10 @@ def load_state(folder):
 
 
 def save_state(state):
+    """Save the session's settings to session.json in its folder (the folder is created if needed).
+
+    Input: state - the session's settings. Returns: nothing.
+    """
     folder = session_dir(state)
     os.makedirs(folder, exist_ok=True)
     with open(os.path.join(folder, 'session.json'), 'w') as f:
@@ -53,26 +72,30 @@ def save_state(state):
 
 
 def template_of(state):
+    """The session's planned parts (Familiarization, pre_test, ...) from the design chosen on the Session page.
+
+    Input: state - the session's settings. Returns: a list of experiment_design.Part.
+    """
     d = state['design']
     return ed.session_template(d['tested_side'], d['contralateral'], d['practice_limb'], d['practice_side'],
-                               d.get('retest', False))
+                               d.get('retest', False), d.get('familiarization', 'practice'))
 
 
 def settings_of(state):
+    """The experiment's numbers (trials per sequence, block pause, ...) saved with the session.
+
+    Input: state - the session's settings. Returns: an experiment_design.Settings.
+    """
     return ed.Settings(**state['settings'])
 
 
 def trial_key(r):
+    """A short text that names one trial, e.g. 'pre_test|2|3|5' (part | block | sequence | trial).
+    Used to remember the user's "use this trial" choices.
+
+    Input: r - a trial row. Returns: the text.
+    """
     return f"{r['Part']}|{r['Block']}|{r['Sequence']}|{r['Trial']}"
-
-
-def _first_frame_xy(cache, pts, frames):
-    """Points (frames, 2) of a camera -> that camera's first-frame coordinates (camera movement removed)."""
-    M = cache['motion'][np.asarray(list(frames))].astype(float)        # (n, 2, 3): first frame -> frame
-    A, t = M[:, :, :2], M[:, :, 2]
-    det = A[:, 0, 0] * A[:, 1, 1] - A[:, 0, 1] * A[:, 1, 0]
-    inv = np.stack([np.stack([A[:, 1, 1], -A[:, 0, 1]], -1), np.stack([-A[:, 1, 0], A[:, 0, 0]], -1)], 1) / det[:, None, None]
-    return np.einsum('nij,nj->ni', inv, np.asarray(pts, float) - t)
 
 
 def _nearest(ref_times, query, tol):
@@ -94,6 +117,10 @@ class Session:
     stops early (or starts late), the analysis continues with the other camera alone."""
 
     def __init__(self, state):
+        """Load the per-frame data (caches) of the session's camera(s) and line up their times.
+
+        Input: state - the session's settings. Cameras without a processed cache are left out.
+        """
         self.state = state
         self.folder = session_dir(state)
         self.cams = {}
@@ -108,13 +135,19 @@ class Session:
 
     @property
     def ready(self):
+        """True if at least one camera has been processed (there is something to analyse)."""
         return bool(self.cams)
 
     @property
     def two_cameras(self):
+        """True if the session uses two cameras and has a calibration file (so 3D positions can be computed)."""
         return self.A is not None and self.B is not None and bool(self.state.get('calibration'))
 
     def _timeline(self):
+        """Build the session timeline: one list of times (camera A's clock) that covers both cameras, and for
+        each camera which of its frames belongs to each moment. Sets self.times, self.fps, self.idx, self.cam_times
+        and self.coverage. Returns: nothing.
+        """
         if not self.cams:
             self.times, self.idx = np.zeros(0), {}
             return
@@ -149,18 +182,31 @@ class Session:
         """Marker of camera c on the session timeline, in that camera's first-frame image coordinates."""
         cache = self.cams[c]
         xy = tm.marker_track(cache['pose'], *key, cache['meta']['size'])
-        xy = _first_frame_xy(cache, xy, range(len(xy)))
+        xy = ek.to_first_frame(xy, cache['motion'][:len(xy)])
         return self.per_frame(c, xy)
 
     def analyze(self):
+        """Run the whole analysis of the session.
+
+        Steps: find when each light went on/off (both cameras merged) -> find touches -> split into parts, blocks,
+        sequences and trials -> follow the wrist/ankle marker (in 3D with two calibrated cameras, otherwise in the
+        camera image) -> compute the measures of each trial -> apply the user's "use this trial" choices.
+        Returns: the result dict (trials, warnings, the switch order, ...), also kept in self.result.
+        """
         st = self.state
         n = len(self.times)
-        events = []
+        events, noisy, noisy_names = [], [], []
         for c, cache in self.cams.items():
             ev = [(s, self.to_master(c, on) if on > 0 else 0, None if off is None else self.to_master(c, off))
                   for s, on, off in ed.light_events(cache['light'], cache['meta']['fps'])]
+            # A view of a switch that flickers is used only inside the blocks the reliable views find
+            bad = ed.noisy_switches(ev, self.times)
+            noisy_names += [f'switch {s} in camera {c.upper()}' for s in sorted(bad)]
+            noisy = ed.merge_camera_events(noisy, [e for e in ev if e[0] in bad], self.fps)
+            ev = [e for e in ev if e[0] not in bad]
             # A light 'still on' at the end of a camera that stopped early isn't a light still on in the session
             events = ev if not events else ed.merge_camera_events(events, ev, self.fps)
+        events = ed.combine_noisy(events, noisy, self.times, self.fps, settings_of(st))
         touch = {}
         for limb in ('upper', 'lower'):
             arrs = [self.per_frame(c, cache[f'touch_{limb}'].T) for c, cache in self.cams.items()]
@@ -168,6 +214,8 @@ class Session:
         template = template_of(st)
         res = ed.analyze_session(events, self.times, self.fps, touch, template, settings_of(st),
                                  st.get('parts_override'))
+        if noisy_names:
+            res['warnings'].append('Flickering light (used only inside blocks): ' + ', '.join(noisy_names) + '.')
         if len(self.cams) == 2:
             (a0, a1), (b0, b1) = self.coverage['a'], self.coverage['b']
             for name, (x0, x1), other in (('A', (a0, a1), (b0, b1)), ('B', (b0, b1), (a0, a1))):
@@ -185,7 +233,7 @@ class Session:
             w, h = cache['meta']['size']
             boxes = np.array(st[f'boxes_{c}'])
             centers = np.column_stack([(boxes[:, 0] + boxes[:, 2]) / 2 * w, (boxes[:, 1] + boxes[:, 3]) / 2 * h])
-            sizes = np.sqrt((boxes[:, 2] - boxes[:, 0]) * w * (boxes[:, 3] - boxes[:, 1]) * h)
+            sizes = np.array([ek.box_size(b, w, h) for b in boxes])
             sources.append(dict(name=f'camera {c.upper()}', cam=c, switch_pos=centers, switch_size=sizes,
                                 track={k: self.track_2d(c, k) for k in keys}))
         if self.two_cameras:
@@ -234,6 +282,10 @@ class Session:
         return k, m
 
     def trial_switch_pos(self, r):
+        """The switch positions in the same units as the trial's data (3D, or the camera image it was taken from).
+
+        Input: r - a trial row. Returns: an array of switch positions, one row per switch.
+        """
         return self.sources[r['Data']]['switch_pos'] if r.get('Data') in self.sources else self.switch_pos
 
     def frame_ref(self, f, prefer=None):
@@ -245,11 +297,20 @@ class Session:
         return None, None
 
     def set_touse(self, r, value):
+        """Mark a trial as used / not used in the summaries (the "touse" check box), and save that choice.
+
+        Inputs: r - the trial row; value - True (use) or False (don't use). Returns: nothing.
+        """
         r['touse'] = bool(value)
         self.state.setdefault('touse_override', {})[trial_key(r)] = bool(value)
         save_state(self.state)
 
     def write_outputs(self):
+        """Write the session's result files to its folder: <subject>_<session>_trials.csv,
+        <subject>_<session>_analysis.xlsx and trials.json (for the all-subjects export).
+
+        Returns: (path of the .csv, path of the .xlsx).
+        """
         st = self.state
         base = os.path.join(self.folder, f"{st['subject']}_{st['session']}")
         trials = self.result['trials']

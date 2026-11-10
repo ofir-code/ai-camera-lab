@@ -1,609 +1,570 @@
-"""Reaching-task lab app: session video(s) -> switches -> MediaPipe -> trials synced with the experiment
-design -> reaction / movement time -> CSV + Excel.
+"""Reaching Lab app: participants -> 2 GoPro videos per day (day 1 and the re-test day) -> everything runs
+automatically (sync, board calibration, switches, MediaPipe, trials synced with the design, RT / MT) -> CSV + Excel.
 
 Run:  venv/bin/python lab_app.py      (or double-click "Lab App.command" / "Lab App.bat")
-Steps (left side of the window): Session -> Switches -> Process -> Blocks & parts -> Trials -> Export.
+
+Left: the participants and the queue (Run all: every day still to do, one after the other - e.g. overnight).
+Right: the chosen participant's days. Each day shows its steps; the app runs them by itself, and each step's
+page shows what it found and lets you change it (then the steps after it run again).
+The steps themselves are in pipeline.py.
 """
 import os
 import sys
-import time
 
-import cv2
-import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QThread, Signal
 
-import matplotlib
-matplotlib.use('QtAgg')
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg  # noqa: E402
-from matplotlib.figure import Figure  # noqa: E402
+import extract_kinematics as ek
+import experiment_design as ed
+import pipeline as pl
+import session_analysis as sa
+from lab_widgets import (THREAD_STACK, BlocksView, BoxView, TrialsView, Worker, group, read_frame, status_html)
 
-import experiment_design as ed  # noqa: E402
-import extract_kinematics as ek  # noqa: E402
-import session_analysis as sa  # noqa: E402
-import session_engine as se  # noqa: E402
-import video_source as vs  # noqa: E402
-
-PART_CHOICES = [ed.IGNORE] + ed.PART_ORDER
-FLAG_COLOR = {'miss': '#f8d7da', 'not detected': '#e2e3e5', 'unknown': '#e2e3e5',
-              'anticipation': '#fff3cd', 'corrected': '#d1ecf1'}
+STATUS_STYLE = {pl.STATUS_TODO: ('#e9ecef', '#495057', ''), pl.STATUS_RUNNING: ('#cfe2ff', '#084298', '⟳ '),
+                pl.STATUS_OK: ('#d1e7dd', '#0f5132', '✓ '), pl.STATUS_WARN: ('#fff3cd', '#664d03', '! '),
+                pl.STATUS_ERROR: ('#f8d7da', '#842029', '✗ '), pl.STATUS_SKIPPED: ('#f1f3f5', '#868e96', '– ')}
+SUMMARY_MARK = {'done': '✓', 'warn': '!', 'error': '✗', 'todo': '…', 'empty': '–', 'running': '⟳'}
+VIDEO_FILTER = 'Videos (*.mp4 *.MP4 *.mov *.MOV *.avi *.mkv)'
 
 
 # -----------------------------
-# Helpers
+# Background runs of the pipeline
 # -----------------------------
-def to_pixmap(bgr):
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    h, w = rgb.shape[:2]
-    img = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
-    return QtGui.QPixmap.fromImage(img.copy())
+class Runner(QThread):
+    """Runs days of the pipeline in the background (one at a time): a queue of (participant, day)."""
+    progress = Signal(int, str, str, str, float, str)    # index, participant, day, step, fraction, text
+    changed = Signal(str, str)                           # participant, day: a step's state changed
+    finished_all = Signal(list)                          # [(participant, day, summary)]
 
-
-def read_frame(path, index=0):
-    """A frame by its frame number (across GoPro chapters)."""
-    return vs.read_frame(path, index)
-
-
-def mmss(ms):
-    if ms is None:
-        return ''
-    s = ms / 1000
-    return f'{int(s // 60)}:{s % 60:05.2f}'
-
-
-def fmt(v, digits=3):
-    if v is None or (isinstance(v, float) and np.isnan(v)):
-        return ''
-    if isinstance(v, (float, np.floating)):
-        return f'{0.0 if abs(v) < 0.5 * 10 ** -digits else v:.{digits}f}'
-    return str(v)
-
-
-class Worker(QThread):
-    """Runs fn(progress, should_stop) in the background."""
-    progress = Signal(float, str)
-    done = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, fn):
+    def __init__(self, items):
         super().__init__()
-        self.fn = fn
+        self.items = list(items)
         self.stop_requested = False
+        self.current = None
+        self.setStackSize(THREAD_STACK)
 
     def run(self):
-        try:
-            self.done.emit(self.fn(lambda f, text='': self.progress.emit(f, text), lambda: self.stop_requested))
-        except Exception as e:  # shown to the user
-            import traceback
-            traceback.print_exc()
-            self.failed.emit(str(e))
-
-
-class BoxView(QtWidgets.QGraphicsView):
-    """A video frame with the numbered switch boxes; can draw one new box by dragging."""
-    box_drawn = Signal(list)
-
-    def __init__(self):
-        super().__init__()
-        self.setScene(QtWidgets.QGraphicsScene(self))
-        self.setRenderHint(QtGui.QPainter.Antialiasing)
-        self.setMinimumSize(640, 360)
-        self.pix = None
-        self.size_wh = (1, 1)
-        self.drawing = False
-        self.start = None
-        self.rubber = None
-
-    def show_frame(self, bgr, boxes):
-        self.scene().clear()
-        self.rubber = None
-        if bgr is None:
-            return
-        self.size_wh = (bgr.shape[1], bgr.shape[0])
-        self.pix = self.scene().addPixmap(to_pixmap(bgr))
-        w, h = self.size_wh
-        pen = QtGui.QPen(QtGui.QColor('#ffd400'), max(2, w // 600))
-        font = QtGui.QFont()
-        font.setPixelSize(max(18, h // 25))
-        font.setBold(True)
-        for k, (x0, y0, x1, y1) in enumerate(boxes or []):
-            self.scene().addRect(x0 * w, y0 * h, (x1 - x0) * w, (y1 - y0) * h, pen)
-            t = self.scene().addSimpleText(str(k + 1), font)
-            t.setBrush(QtGui.QColor('#ffd400'))
-            t.setPos(x0 * w, y0 * h - font.pixelSize() * 1.3)
-        self.fitInView(self.scene().sceneRect(), Qt.KeepAspectRatio)
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        if self.scene().items():
-            self.fitInView(self.scene().sceneRect(), Qt.KeepAspectRatio)
-
-    def start_drawing(self):
-        self.drawing = True
-        self.setCursor(Qt.CrossCursor)
-
-    def mousePressEvent(self, e):
-        if self.drawing:
-            self.start = self.mapToScene(e.position().toPoint())
-            self.rubber = self.scene().addRect(QtCore.QRectF(self.start, self.start),
-                                               QtGui.QPen(QtGui.QColor('#00e5ff'), 4))
-        super().mousePressEvent(e)
-
-    def mouseMoveEvent(self, e):
-        if self.drawing and self.start is not None and self.rubber is not None:
-            self.rubber.setRect(QtCore.QRectF(self.start, self.mapToScene(e.position().toPoint())).normalized())
-        super().mouseMoveEvent(e)
-
-    def mouseReleaseEvent(self, e):
-        if self.drawing and self.start is not None:
-            r = QtCore.QRectF(self.start, self.mapToScene(e.position().toPoint())).normalized()
-            self.drawing, self.start = False, None
-            self.setCursor(Qt.ArrowCursor)
-            w, h = self.size_wh
-            if r.width() > 5 and r.height() > 5:
-                self.box_drawn.emit([round(max(0, r.left()) / w, 4), round(max(0, r.top()) / h, 4),
-                                     round(min(w, r.right()) / w, 4), round(min(h, r.bottom()) / h, 4)])
-        super().mouseReleaseEvent(e)
-
-
-def group(title, layout):
-    g = QtWidgets.QGroupBox(title)
-    g.setLayout(layout)
-    return g
-
-
-def path_row(edit, on_browse, extra=()):
-    row = QtWidgets.QHBoxLayout()
-    row.addWidget(edit, 1)
-    b = QtWidgets.QPushButton('Browse…')
-    b.clicked.connect(on_browse)
-    row.addWidget(b)
-    for w in extra:
-        row.addWidget(w)
-    return row
+        def prog(i, pid, day, step, f, text):
+            self.current = (pid, day)
+            self.progress.emit(i, pid, day, step, f, text)
+        def changed(st):
+            self.current = (st['subject'], st['session'])
+            self.changed.emit(st['subject'], st['session'])
+        out = pl.run_queue(self.items, prog, lambda: self.stop_requested, changed)
+        self.current = None
+        self.finished_all.emit(out)
 
 
 # -----------------------------
-# Main window
+# Participant (design) dialog
 # -----------------------------
-class LabApp(QtWidgets.QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle('Reaching Lab - MediaPipe')
-        self.resize(1400, 860)
-        self.state = sa.default_state()
-        self.session = None
-        self.worker = None
+class ParticipantDialog(QtWidgets.QDialog):
+    """New participant (id, design, videos of the days) or the design of an existing one."""
 
-        self.nav = QtWidgets.QListWidget()
-        self.nav.setFixedWidth(190)
-        self.nav.setStyleSheet('QListWidget{font-size:15px;} QListWidget::item{padding:10px;}')
-        self.pages = QtWidgets.QStackedWidget()
-        for name, page in [('1  Session', self.page_session()), ('2  Switches', self.page_switches()),
-                           ('3  Process', self.page_process()), ('4  Blocks & parts', self.page_blocks()),
-                           ('5  Trials', self.page_trials()), ('6  Export', self.page_export())]:
-            self.nav.addItem(name)
-            self.pages.addWidget(page)
-        self.nav.currentRowChanged.connect(self.on_page)
-        central = QtWidgets.QWidget()
-        lay = QtWidgets.QHBoxLayout(central)
-        lay.addWidget(self.nav)
-        lay.addWidget(self.pages, 1)
-        self.setCentralWidget(central)
-        self.status = self.statusBar()
-        self.state_to_form()
-        self.nav.setCurrentRow(0)
-
-    # ---------- shared ----------
-    def info(self, text):
-        self.status.showMessage(text, 15000)
-
-    def error(self, text):
-        QtWidgets.QMessageBox.warning(self, 'Reaching Lab', text)
-
-    def on_page(self, i):
-        self.form_to_state()
-        self.pages.setCurrentIndex(i)
-        [lambda: None, self.refresh_switches, self.refresh_process, self.refresh_blocks,
-         self.refresh_trials, lambda: None][i]()
-
-    def save(self):
-        self.form_to_state()
-        if not self.state['subject'].strip():
-            self.error('Enter a subject ID first.')
-            return False
-        sa.save_state(self.state)
-        self.info(f'Saved to {sa.session_dir(self.state)}')
-        return True
-
-    def run_bg(self, fn, on_done, label, bar=None):
-        if self.worker is not None and self.worker.isRunning():
-            self.error('Something is already running - wait for it or press Cancel.')
-            return
-        self.worker = Worker(fn)
-        bar = bar or self.proc_bar
-        t0 = time.time()
-
-        def prog(f, text):
-            bar.setValue(int(f * 1000))
-            el = time.time() - t0
-            left = el / f - el if f > 0.01 else None
-            bar.setFormat(f'{label}  {f:.0%}' + (f'  - about {left / 60:.0f} min left' if left else '') +
-                          (f'  ({text})' if text else ''))
-        self.worker.progress.connect(prog)
-        self.worker.done.connect(lambda r: (bar.setFormat(f'{label}: done'), on_done(r)))
-        self.worker.failed.connect(lambda m: (bar.setFormat(f'{label}: failed'), self.error(m)))
-        bar.setRange(0, 1000)
-        bar.setValue(0)
-        self.worker.start()
-
-    def cancel(self):
-        if self.worker is not None:
-            self.worker.stop_requested = True
-
-    def load_session(self):
-        try:
-            self.session = sa.Session(self.state)
-            if self.session.ready:
-                self.session.analyze()
-        except Exception as e:
-            self.session = None
-            self.error(f'Could not analyse the session: {e}')
-
-    # ---------- 1. Session ----------
-    def page_session(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        top = QtWidgets.QHBoxLayout()
-        b_open = QtWidgets.QPushButton('Open a saved session…')
-        b_open.clicked.connect(self.open_session)
-        b_new = QtWidgets.QPushButton('New session')
-        b_new.clicked.connect(self.new_session)
-        b_save = QtWidgets.QPushButton('Save')
-        b_save.clicked.connect(self.save)
-        for b in (b_open, b_new, b_save):
-            top.addWidget(b)
-        top.addStretch()
-        v.addLayout(top)
-
+    def __init__(self, parent, participant=None):
+        super().__init__(parent)
+        self.p = participant
+        self.setWindowTitle('New participant' if participant is None else f'Participant {participant["id"]}')
+        self.resize(760, 0)
+        v = QtWidgets.QVBoxLayout(self)
         f = QtWidgets.QFormLayout()
-        self.e_subject = QtWidgets.QLineEdit()
-        self.c_session = QtWidgets.QComboBox()
-        self.c_session.addItems(['d1  (day 1: familiarization, tests, practice)', 'd2  (re-test day)'])
-        f.addRow('Subject ID', self.e_subject)
-        f.addRow('Session', self.c_session)
+        self.e_id = QtWidgets.QLineEdit()
+        self.e_id.setPlaceholderText('e.g. S01')
+        if participant is not None:
+            self.e_id.setText(participant['id'])
+            self.e_id.setEnabled(False)
+        f.addRow('Participant ID', self.e_id)
         v.addWidget(group('Participant', f))
 
-        f = QtWidgets.QFormLayout()
-        self.e_cam_a = QtWidgets.QLineEdit()
-        self.e_cam_a.editingFinished.connect(lambda: self.on_video_chosen(self.e_cam_a))
-        f.addRow('Camera A video', path_row(self.e_cam_a, lambda: self.browse_video(self.e_cam_a)))
-        self.e_cam_b = QtWidgets.QLineEdit()
-        self.e_cam_b.editingFinished.connect(lambda: self.on_video_chosen(self.e_cam_b))
-        clr = QtWidgets.QPushButton('Clear')
-        clr.clicked.connect(lambda: (self.e_cam_b.clear(), self.l_videos.clear()))
-        f.addRow('Camera B video (optional)', path_row(self.e_cam_b, lambda: self.browse_video(self.e_cam_b), [clr]))
-        self.l_videos = QtWidgets.QLabel()
-        self.l_videos.setWordWrap(True)
-        self.l_videos.setTextFormat(Qt.RichText)
-        f.addRow('', self.l_videos)
-        self.s_offset = QtWidgets.QDoubleSpinBox()
-        self.s_offset.setRange(-36000, 36000)
-        self.s_offset.setDecimals(4)
-        self.s_offset.setSuffix(' s')
-        b_tc = QtWidgets.QPushButton('From timecode')
-        b_tc.setToolTip('GoPro cameras synced in the Quik app (Sync Timecode): the offset from the start timecodes')
-        b_tc.clicked.connect(lambda: self.auto_offset(force=True))
-        b_snd = QtWidgets.QPushButton('From the sound')
-        b_snd.clicked.connect(self.find_offset)
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.s_offset)
-        row.addWidget(b_tc)
-        row.addWidget(b_snd)
-        row.addWidget(QtWidgets.QLabel('seconds into video A at which video B started'))
-        row.addStretch()
-        f.addRow('Sync offset', row)
-        self.l_sync = QtWidgets.QLabel()
-        self.l_sync.setWordWrap(True)
-        self.l_sync.setTextFormat(Qt.RichText)
-        f.addRow('', self.l_sync)
-        self.e_calib = QtWidgets.QLineEdit()
-        b_board = QtWidgets.QPushButton('Board calibration…')
-        b_board.setToolTip('The printed ChArUco board filmed by both cameras (start of the session, or separate clips)')
-        b_board.clicked.connect(self.board_calibration)
-        b_click = QtWidgets.QPushButton('Click calibration…')
-        b_click.clicked.connect(self.click_calibration)
-        b_reuse = QtWidgets.QPushButton('Use an earlier calibration…')
-        b_reuse.setToolTip('A calibration file of an earlier recording of the same day - only if the cameras were '
-                           'not moved since')
-        b_reuse.clicked.connect(self.browse_calib)
-        crow = QtWidgets.QHBoxLayout()
-        crow.addWidget(self.e_calib, 1)
-        for b in (b_board, b_click, b_reuse):
-            crow.addWidget(b)
-        f.addRow('Camera calibration', crow)
-        v.addWidget(group('Videos (one recording of the whole session per camera; GoPro: choose the first chapter)', f))
-
+        d = (participant or {}).get('design') or pl.DESIGN_DEFAULT
         f = QtWidgets.QFormLayout()
         self.c_tested = QtWidgets.QComboBox()
         self.c_tested.addItems(['right', 'left'])
-        self.k_contra = QtWidgets.QCheckBox('also test the contralateral (other) arm, pre and post')
+        self.c_tested.setCurrentText(d['tested_side'])
+        self.k_contra = QtWidgets.QCheckBox('also test the contralateral (other) arm, pre, post and re-test')
+        self.k_contra.setChecked(d['contralateral'])
         self.c_plimb = QtWidgets.QComboBox()
         self.c_plimb.addItems(['upper', 'lower'])
+        self.c_plimb.setCurrentText(d['practice_limb'])
         self.c_pside = QtWidgets.QComboBox()
         self.c_pside.addItems(['right', 'left'])
+        self.c_pside.setCurrentText(d['practice_side'])
         f.addRow('Tested arm (pre / post / re-test)', self.c_tested)
         f.addRow('', self.k_contra)
         prow = QtWidgets.QHBoxLayout()
-        prow.addWidget(QtWidgets.QLabel('limb'))
-        prow.addWidget(self.c_plimb)
-        prow.addWidget(QtWidgets.QLabel('side'))
-        prow.addWidget(self.c_pside)
+        for lab, w in (('limb', self.c_plimb), ('side', self.c_pside)):
+            prow.addWidget(QtWidgets.QLabel(lab))
+            prow.addWidget(w)
         prow.addStretch()
-        f.addRow('Practice (and familiarization)', prow)
+        f.addRow('Practice', prow)
+        self.c_fam = QtWidgets.QComboBox()
+        self.c_fam.addItems(['with the practice limb', 'with the tested arm'])
+        self.c_fam.setCurrentIndex(1 if d.get('familiarization') == 'test' else 0)
+        self.c_fam.currentIndexChanged.connect(self.update_plan)
+        f.addRow('Familiarization', self.c_fam)
         self.l_plan = QtWidgets.QLabel()
         self.l_plan.setWordWrap(True)
-        f.addRow('Session plan', self.l_plan)
-        for wdg in (self.c_tested, self.c_plimb, self.c_pside, self.c_session):
-            wdg.currentIndexChanged.connect(self.update_plan)
+        f.addRow('Plan', self.l_plan)
+        for w in (self.c_tested, self.c_plimb, self.c_pside):
+            w.currentIndexChanged.connect(self.update_plan)
         self.k_contra.toggled.connect(self.update_plan)
         v.addWidget(group('Experimental design', f))
 
+        st = (participant or {}).get('settings') or vars(ed.Settings())
         f = QtWidgets.QFormLayout()
         self.s_tps = QtWidgets.QSpinBox()
         self.s_tps.setRange(1, 20)
+        self.s_tps.setValue(st['trials_per_sequence'])
         self.s_spb = QtWidgets.QSpinBox()
         self.s_spb.setRange(1, 20)
+        self.s_spb.setValue(st['sequences_per_block'])
         self.s_window = QtWidgets.QDoubleSpinBox()
         self.s_window.setRange(0.2, 5)
         self.s_window.setSuffix(' s')
+        self.s_window.setValue(st['light_window_s'])
         self.s_gap = QtWidgets.QDoubleSpinBox()
         self.s_gap.setRange(2, 120)
         self.s_gap.setSuffix(' s')
-        self.e_pattern = QtWidgets.QLineEdit()
-        self.e_pattern.setPlaceholderText('auto (the first 6 lights of the blocks), or e.g. 1,4,3,5,4,2')
+        self.s_gap.setValue(st['block_gap_s'])
+        self.e_pattern = QtWidgets.QLineEdit(','.join(map(str, st.get('pattern') or [])))
+        self.e_pattern.setPlaceholderText('auto (from the data), or e.g. 1,4,3,5,4,2')
+        import calibrate_cameras as cc
+        self.s_square = QtWidgets.QDoubleSpinBox()
+        self.s_square.setRange(5, 200)
+        self.s_square.setDecimals(1)
+        self.s_square.setSuffix(' mm')
+        self.s_square.setValue((participant or {}).get('square_mm', cc.BOARD_SQUARE_MM))
         f.addRow('Trials per sequence', self.s_tps)
         f.addRow('Sequences per block', self.s_spb)
         f.addRow('Light window (miss if not hit within)', self.s_window)
         f.addRow('New block after a pause longer than', self.s_gap)
         f.addRow('Switch order in a sequence', self.e_pattern)
-        adv = group('Advanced', f)
-        adv.setCheckable(True)
-        adv.setChecked(False)
-        for i in range(f.rowCount() * 2):
-            pass
-        v.addWidget(adv)
-        v.addStretch()
-        return w
+        f.addRow('Calibration board square (measured)', self.s_square)
+        self.adv = group('Settings (usually left as they are)', f)
+        self.adv.setCheckable(True)
+        self.adv.setChecked(participant is not None)
+        v.addWidget(self.adv)
+
+        self.videos = {}
+        if participant is None:
+            f = QtWidgets.QFormLayout()
+            for day in pl.DAYS:
+                row = QtWidgets.QHBoxLayout()
+                e = QtWidgets.QLineEdit()
+                e.setReadOnly(True)
+                e.setPlaceholderText('the 2 videos of this day (can be added later)')
+                b = QtWidgets.QPushButton('Choose…')
+                b.clicked.connect(lambda _, day=day: self.choose(day))
+                row.addWidget(e, 1)
+                row.addWidget(b)
+                self.videos[day] = (e, [])
+                f.addRow(pl.DAY_NAMES[day], row)
+            self.k_start = QtWidgets.QCheckBox('Start running now')
+            self.k_start.setChecked(True)
+            f.addRow('', self.k_start)
+            v.addWidget(group('Videos (GoPro: choose the first chapter of each camera, GX01....MP4)', f))
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        self.update_plan()
+
+    def choose(self, day):
+        paths = choose_videos(self)
+        if paths is not None:
+            e, lst = self.videos[day]
+            lst[:] = paths
+            e.setText('   +   '.join(os.path.basename(p) for p in paths))
+
+    def design(self):
+        return dict(tested_side=self.c_tested.currentText(), contralateral=self.k_contra.isChecked(),
+                    practice_limb=self.c_plimb.currentText(), practice_side=self.c_pside.currentText(),
+                    familiarization='test' if self.c_fam.currentIndex() == 1 else 'practice')
+
+    def settings(self):
+        base = dict((self.p or {}).get('settings') or vars(ed.Settings()))
+        pattern = ed.parse_pattern(self.e_pattern.text())
+        base.update(trials_per_sequence=self.s_tps.value(), sequences_per_block=self.s_spb.value(),
+                    light_window_s=self.s_window.value(), block_gap_s=self.s_gap.value(), pattern=pattern)
+        return base
 
     def update_plan(self, *_):
-        self.form_to_state()
-        parts = sa.template_of(self.state)
-        self.l_plan.setText(' → '.join(f'{p.name} ({p.blocks} blocks, {p.limb} {p.side})' for p in parts)
-                            + f'   =  {sum(p.blocks for p in parts)} blocks')
-
-    def browse_video(self, edit):
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose a video (GoPro: the first chapter, GX01....MP4)',
-                                                     os.path.join(sa.PROJECT_DIR, 'media'),
-                                                     'Videos (*.mov *.mp4 *.avi *.mkv *.MOV *.MP4)')
-        if p:
-            edit.setText(p)
-            self.on_video_chosen(edit)
-
-    def browse_calib(self):
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, 'Calibration file of an earlier recording (cameras not moved since)', sa.session_dir(self.state)
-            if os.path.isdir(sa.session_dir(self.state)) else sa.RESULTS_DIR, 'JSON (*.json)')
-        if p:
-            self.e_calib.setText(p)
-            self.save()
-
-    def on_video_chosen(self, edit):
-        """GoPro chapters: use the first one, show them and check they follow each other; then the offset."""
-        path = edit.text().strip()
-        if path and os.path.exists(path):
-            first = vs.first_chapter(path)
-            if first != path:
-                edit.setText(first)
-                self.info(f'Using the first chapter of that clip: {os.path.basename(first)}')
-        self.describe_videos()
-        self.auto_offset()
-
-    def describe_videos(self):
-        import timecode
+        d = self.design()
         lines = []
-        info = {}
-        for cam, edit in (('A', self.e_cam_a), ('B', self.e_cam_b)):
-            path = edit.text().strip()
-            if not path or not os.path.exists(path):
-                continue
-            src = vs.VideoSource(path, hardware=False)
-            c = src.info[0]
-            info[cam] = c
-            names = ', '.join(os.path.basename(p) for p in src.paths)
-            length = f'{src.total_ms / 60000:.1f} min' if src.total_ms >= 60000 else f'{src.total_ms / 1000:.1f} s'
-            text = (f'<b>{cam}</b>: {c["width"]}x{c["height"]}, {c["fps"]:.3f} fps, {length}'
-                    + (f' - {len(src.paths)} chapters ({names})' if len(src.paths) > 1 else ''))
-            warn = src.check() + timecode.chapter_gaps(path)
-            if warn:
-                text += '<br><span style="color:#b00">' + '<br>'.join(warn) + '</span>'
-            lines.append(text)
-        if len(info) == 2:
-            a, b = info['A'], info['B']
-            if (a['width'], a['height']) != (b['width'], b['height']) or abs(a['fps'] - b['fps']) > 0.01:
-                lines.append('<span style="color:#b00">The two videos differ in resolution or frame rate - record both '
-                             'cameras with the same settings (4K, 60 fps, Linear, HyperSmooth off).</span>')
-        self.l_videos.setText('<br>'.join(lines))
+        for day in pl.DAYS:
+            parts = ed.session_template(d['tested_side'], d['contralateral'], d['practice_limb'], d['practice_side'],
+                                        day != 'd1', d['familiarization'])
+            lines.append(f'<b>{pl.DAY_NAMES[day]}</b>: ' + ' → '.join(
+                f'{p.name} ({p.blocks}, {"arm" if p.limb == "upper" else "leg"})' for p in parts)
+                         + f' = {sum(p.blocks for p in parts)} blocks')
+        self.l_plan.setText('<br>'.join(lines))
 
-    def auto_offset(self, force=False):
-        """Both videos chosen: the offset from the GoPro timecodes, and from the sound as a cross-check."""
-        import timecode
-        a, b = self.e_cam_a.text().strip(), self.e_cam_b.text().strip()
-        if not (a and b and os.path.exists(a) and os.path.exists(b)):
-            return
+    def accept(self):
         try:
-            off, ta, tb = timecode.timecode_offset(a, b)
-        except Exception as e:
-            if force:
-                self.error(f'Could not get the offset from the timecodes:\n{e}')
-            first = str(e).splitlines()[0].replace(os.path.dirname(a) + os.sep, '').replace(os.path.dirname(b) + os.sep, '')
-            self.l_sync.setText(f'No timecode offset ({first}) - use "From the sound" or type it in.')
+            problem = ed.pattern_problem(self.settings()['pattern'], ed.Settings(**self.settings()))
+            if problem:
+                raise ValueError(problem)
+            if self.p is None:
+                pl.check_id(self.e_id.text())
+                if self.e_id.text().strip() in pl.list_participants():
+                    raise ValueError(f'Participant {self.e_id.text().strip()} already exists.')
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, 'Participant', str(e))
             return
-        self.s_offset.setValue(off)
-        fps = ta['fps']
-        note = '' if ta['source'] == 'ffprobe' else ' (read from the files - ffprobe not installed)'
-        self.l_sync.setText(f'From the timecodes{note}: A starts {ta["timecode"]}, B starts {tb["timecode"]} '
-                            f'→ offset {off:+.4f} s. Checking against the sound…')
-        self.form_to_state()
-        self.save()
-        if sys.platform != 'darwin':
-            self.l_sync.setText(self.l_sync.text().replace('Checking against the sound…', '(sound check needs macOS)'))
-            return
+        super().accept()
 
-        def job(progress, stop):
-            import sync_videos
-            return sync_videos.audio_offset(a, b)
 
-        def done(r):
-            snd, conf = r
-            diff = abs(snd - off) * fps
-            base = self.l_sync.text().replace(' Checking against the sound…', '')
-            if conf < 1.5:
-                msg = f' Sound: {snd:+.4f} s, but the sound match is unclear - not used as a check.'
-            elif diff > 1:
-                msg = (f'<br><span style="color:#b00"><b>Warning:</b> the sound gives {snd:+.4f} s, '
-                       f'{diff:.1f} frames from the timecode offset - check the cameras\' timecode sync.</span>')
+def choose_videos(parent):
+    """Let the user choose the 1 or 2 videos of a day (camera A and B). Returns their paths (first chapters),
+    or None if cancelled / not valid."""
+    import video_source as vs
+    paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+        parent, 'The videos of this day: one per camera (GoPro: the first chapter, GX01....MP4)',
+        os.path.expanduser('~'), VIDEO_FILTER)
+    if not paths:
+        return None
+    firsts = list(dict.fromkeys(vs.first_chapter(p) for p in sorted(paths)))
+    if len(firsts) > 2:
+        QtWidgets.QMessageBox.warning(parent, 'Videos', 'Choose one video per camera (two at most). The chapters of '
+                                      'a GoPro video (GX02…, GX03…) are found by themselves.')
+        return None
+    if len(firsts) < len(paths):
+        QtWidgets.QMessageBox.information(parent, 'Videos', 'Some of the chosen files are chapters of the same '
+                                          'video - it is used once: ' + ', '.join(map(os.path.basename, firsts)))
+    return firsts
+
+
+# -----------------------------
+# One day
+# -----------------------------
+class DayView(QtWidgets.QWidget):
+    """A participant's day: its videos, the step bar and the page of the chosen step."""
+    run_requested = Signal(str, str)        # participant, day
+
+    def __init__(self, app, day):
+        super().__init__()
+        self.app, self.day = app, day
+        self.pid = None
+        self.st = None
+        self.session = None
+        self.busy = False
+        self.edit_widgets = []
+        v = QtWidgets.QVBoxLayout(self)
+
+        top = QtWidgets.QHBoxLayout()
+        self.l_videos = QtWidgets.QLabel()
+        self.l_videos.setTextFormat(Qt.RichText)
+        self.l_videos.setWordWrap(True)
+        top.addWidget(self.l_videos, 1)
+        self.b_choose = QtWidgets.QPushButton('Choose videos…')
+        self.b_choose.clicked.connect(self.choose_videos)
+        self.b_swap = QtWidgets.QPushButton('Swap A / B')
+        self.b_swap.setToolTip('Make camera A camera B and the other way round')
+        self.b_swap.clicked.connect(self.swap)
+        self.b_run = QtWidgets.QPushButton('Run')
+        self.b_run.setStyleSheet('font-weight:bold; padding:6px 20px;')
+        self.b_run.setToolTip('Run the steps of this day that are not done yet')
+        self.b_run.clicked.connect(lambda: self.run_requested.emit(self.pid, self.day))
+        for b in (self.b_choose, self.b_swap, self.b_run):
+            top.addWidget(b)
+        v.addLayout(top)
+
+        bar = QtWidgets.QHBoxLayout()
+        bar.setSpacing(4)
+        self.step_buttons = {}
+        for i, s in enumerate(pl.STEPS):
+            b = QtWidgets.QPushButton(f'{i + 1}. {pl.STEP_NAMES[s]}'.replace('&', '&&'))
+            b.setCheckable(True)
+            b.setMinimumHeight(38)
+            b.clicked.connect(lambda _, s=s: self.show_step(s))
+            bar.addWidget(b, 1)
+            self.step_buttons[s] = b
+        v.addLayout(bar)
+
+        self.l_status = QtWidgets.QLabel()
+        self.l_status.setTextFormat(Qt.RichText)
+        self.l_status.setWordWrap(True)
+        self.l_status.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.l_status.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
+        self.l_status.setOpenExternalLinks(True)
+        self.l_status.setStyleSheet('QLabel{background:#f8f9fa; border:1px solid #dee2e6; padding:8px;}')
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(self.l_status)
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(240)
+        scroll.setMinimumHeight(110)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        v.addWidget(scroll)
+
+        self.pages = QtWidgets.QStackedWidget()
+        self.page_of = {}
+        for s, make in (('videos', self.page_videos), ('calibration', self.page_calibration),
+                        ('switches', self.page_switches), ('processing', self.page_processing),
+                        ('analysis', self.page_analysis), ('results', self.page_results)):
+            self.page_of[s] = self.pages.addWidget(make())
+        v.addWidget(self.pages, 1)
+
+        bottom = QtWidgets.QHBoxLayout()
+        bottom.addStretch()
+        self.b_again = QtWidgets.QPushButton('Run this step again')
+        self.b_again.setToolTip('Run this step again automatically (and the steps after it)')
+        self.b_again.clicked.connect(self.run_again)
+        bottom.addWidget(self.b_again)
+        v.addLayout(bottom)
+        self.current_step = 'videos'
+        self.edit_widgets += [self.b_choose, self.b_swap, self.b_again]
+
+    # ---------- state ----------
+    def set_participant(self, pid):
+        self.pid = pid
+        self.session = None
+        self.reload()
+        if self.st is not None:
+            self.show_step(pl.next_step(self.st) or 'analysis')
+
+    def reload(self):
+        """Read the day's state from disk and refresh what is shown."""
+        old = self.st['steps']['analysis'] if self.st else None
+        self.st = (pl.load_day(self.pid, self.day) if self.pid and pl.day_exists(self.pid, self.day) else None)
+        if self.session is not None:      # keep the loaded analysis unless the analysis step changed
+            if self.st is None or self.st['steps']['analysis'] != old:
+                self.session = None
             else:
-                msg = f' <span style="color:#080">Sound agrees: {snd:+.4f} s ({diff:.2f} frames apart).</span>'
-            self.l_sync.setText(base + msg)
+                self.session.state = self.st
+        self.refresh()
 
-        self.sync_worker = Worker(job)
-        self.sync_worker.done.connect(done)
-        self.sync_worker.failed.connect(lambda m: self.l_sync.setText(
-            self.l_sync.text().replace('Checking against the sound…', f'(sound check failed: {m})')))
-        self.sync_worker.start()
+    def save(self):
+        pl.save_day(self.st)
 
-    def state_to_form(self):
-        s = self.state
-        self.e_subject.setText(s['subject'])
-        self.c_session.setCurrentIndex(0 if s['session'] == 'd1' else 1)
-        self.e_cam_a.setText(s['cam_a'])
-        self.e_cam_b.setText(s.get('cam_b') or '')
-        self.s_offset.setValue(s.get('offset_s') or 0)
-        self.e_calib.setText(s.get('calibration') or '')
-        d = s['design']
-        self.c_tested.setCurrentText(d['tested_side'])
-        self.k_contra.setChecked(d['contralateral'])
-        self.c_plimb.setCurrentText(d['practice_limb'])
-        self.c_pside.setCurrentText(d['practice_side'])
-        st = s['settings']
-        self.s_tps.setValue(st['trials_per_sequence'])
-        self.s_spb.setValue(st['sequences_per_block'])
-        self.s_window.setValue(st['light_window_s'])
-        self.s_gap.setValue(st['block_gap_s'])
-        self.e_pattern.setText(','.join(map(str, st.get('pattern') or [])))
-        self.update_plan()
-        self.l_sync.clear()
-        try:
-            self.describe_videos()
-        except Exception as e:   # a video that moved etc. - shown, not fatal
-            self.l_videos.setText(f'<span style="color:#b00">{e}</span>')
+    def set_busy(self, busy):
+        """The day is being run in the background: no edits meanwhile."""
+        self.busy = busy
+        for w in self.edit_widgets:
+            w.setEnabled(not busy)
+        self.b_run.setEnabled(not busy and not self.app.running() and self.st is not None)
 
-    def form_to_state(self):
-        s = self.state
-        old_a, old_b = s['cam_a'], s.get('cam_b')
-        s['subject'] = self.e_subject.text().strip()
-        s['session'] = 'd1' if self.c_session.currentIndex() == 0 else 'd2'
-        s['cam_a'] = self.e_cam_a.text().strip()
-        s['cam_b'] = self.e_cam_b.text().strip()
-        if s['cam_a'] != old_a:
-            s['boxes_a'] = None
-        if s['cam_b'] != old_b:
-            s['boxes_b'] = None
-        s['offset_s'] = self.s_offset.value()
-        s['calibration'] = self.e_calib.text().strip()
-        s['design'] = dict(tested_side=self.c_tested.currentText(), contralateral=self.k_contra.isChecked(),
-                           practice_limb=self.c_plimb.currentText(), practice_side=self.c_pside.currentText(),
-                           retest=s['session'] != 'd1')
-        try:
-            pattern = ed.parse_pattern(self.e_pattern.text())
-        except ValueError:
-            pattern = []
-        s['settings'].update(trials_per_sequence=self.s_tps.value(), sequences_per_block=self.s_spb.value(),
-                             light_window_s=self.s_window.value(), block_gap_s=self.s_gap.value(), pattern=pattern)
-
-    def open_session(self):
-        folder = QtWidgets.QFileDialog.getExistingDirectory(self, 'Session folder (results/<subject>/<session>)',
-                                                            sa.RESULTS_DIR)
-        if not folder:
-            return
-        # Also accept the subject folder (results/<subject>) or results/: offer the sessions found below it
-        found = sorted(os.path.dirname(os.path.join(r, f)) for r, _, fs in os.walk(folder) for f in fs
-                       if f == 'session.json' and os.path.relpath(r, folder).count(os.sep) < 2)
-        if not found:
-            self.error(f'No saved session in {folder} - a session is the folder results/<subject>/<session> '
-                       '(e.g. results/S01/d1).')
-            return
-        if len(found) > 1:
-            names = [os.path.relpath(p, sa.RESULTS_DIR) if p.startswith(sa.RESULTS_DIR) else p for p in found]
-            name, ok = QtWidgets.QInputDialog.getItem(self, 'Open a session', 'Sessions in that folder:', names, 0, False)
-            if not ok:
-                return
-            folder = found[names.index(name)]
+    def refresh(self):
+        st = self.st
+        if st is None or not st.get('cam_a'):
+            self.l_videos.setText('<b>No videos yet</b> - choose the 2 videos of this day (one per camera).')
         else:
-            folder = found[0]
-        self.state = sa.load_state(folder)
-        self.state_to_form()
+            names = [f'<b>A</b>: {os.path.basename(st["cam_a"])}']
+            if st.get('cam_b'):
+                names.append(f'<b>B</b>: {os.path.basename(st["cam_b"])}')
+            elif st.get('cam_b_unsynced'):
+                names.append(f'<b>B</b>: <s>{os.path.basename(st["cam_b_unsynced"])}</s> (not lined up - left out)')
+            else:
+                names.append('<b>B</b>: none (2D)')
+            self.l_videos.setText('&nbsp;&nbsp;&nbsp;'.join(names))
+        for s, b in self.step_buttons.items():
+            status = st['steps'][s]['status'] if st else pl.STATUS_TODO
+            bg, fg, mark = STATUS_STYLE[status]
+            b.setText(f'{mark}{pl.STEPS.index(s) + 1}. {pl.STEP_NAMES[s]}'.replace('&', '&&'))
+            b.setStyleSheet(f'QPushButton{{background:{bg}; color:{fg}; border:1px solid #ced4da; border-radius:4px;}}'
+                            f'QPushButton:checked{{border:2px solid #0d6efd; font-weight:bold;}}')
+        self.b_swap.setEnabled(bool(st and (st.get('cam_b') or st.get('cam_b_unsynced'))) and not self.busy)
+        self.b_run.setEnabled(bool(st and st.get('cam_a')) and not self.busy and not self.app.running())
+        self.show_step(self.current_step)
+
+    def show_step(self, step):
+        self.current_step = step
+        for s, b in self.step_buttons.items():
+            b.setChecked(s == step)
+        self.pages.setCurrentIndex(self.page_of[step])
+        if self.st is None:
+            self.l_status.setText('Choose the videos of this day first.')
+        else:
+            x = self.st['steps'][step]
+            text = status_html(x) if x['status'] != pl.STATUS_TODO or x['message'] else (
+                'Not run yet - press <b>Run</b> (or <b>Run all</b> on the left) and the app does it by itself.')
+            self.l_status.setText(text + (f'<br><small style="color:#888">{x["time"]}</small>'
+                                          if x['status'] not in (pl.STATUS_TODO, pl.STATUS_RUNNING) else ''))
+        refresh = getattr(self, f'refresh_{step}', None)
+        if refresh:
+            refresh()
+
+    def progress(self, step, f, text):
+        if self.st and self.st['steps'][step]['status'] == pl.STATUS_RUNNING:
+            self.step_buttons[step].setText(f'⟳ {pl.STEPS.index(step) + 1}. {pl.STEP_NAMES[step]} {f:.0%}'.replace('&', '&&'))
+
+    def run_again(self):
+        if self.st is None:
+            return
+        pl.mark_todo(self.st, self.current_step)
+        self.save()
         self.session = None
-        self.info(f'Opened {folder}')
+        self.refresh()
+        self.run_requested.emit(self.pid, self.day)
 
-    def new_session(self):
-        self.state = sa.default_state(subject='', session='d1')
+    def changed(self, step, message, run=True):
+        """The user changed a step by hand: the steps after it run again."""
+        pl.edited(self.st, step, message)
         self.session = None
-        self.state_to_form()
+        self.refresh()
+        if run:
+            self.run_requested.emit(self.pid, self.day)
 
-    def find_offset(self):
-        self.form_to_state()
-        if not (self.state['cam_a'] and self.state['cam_b']):
-            self.error('Choose both videos first.')
+    # ---------- top buttons ----------
+    def choose_videos(self):
+        paths = choose_videos(self)
+        if paths is None:
             return
-        if sys.platform != 'darwin':
-            self.error('Finding the offset from the sound needs macOS - type the offset in.')
-            return
-        import sync_videos
-        try:
-            off, conf = sync_videos.audio_offset(self.state['cam_a'], self.state['cam_b'])
-        except Exception as e:
-            self.error(f'Could not read the sound: {e}')
-            return
-        self.s_offset.setValue(off)
-        self.info(f'Offset {off:+.3f} s (match {conf:.1f}x the next best' +
-                  (' - unclear, check it' if conf < 1.5 else '') + ')')
+        if self.st and self.st.get('cam_a') and self.st['steps']['processing']['status'] in pl.DONE:
+            if QtWidgets.QMessageBox.question(self, 'Videos', 'Other videos: this day\'s results are made again from '
+                                              'the start. Go on?') != QtWidgets.QMessageBox.Yes:
+                return
+        self.st = pl.set_videos(self.pid, self.day, paths[0], paths[1] if len(paths) > 1 else '')
+        self.session = None
+        self.app.refresh_list()
+        self.show_step('videos')
+        self.refresh()
+        self.run_requested.emit(self.pid, self.day)
 
-    def board_calibration(self):
-        self.form_to_state()
-        if not self.save():
-            return
-        dlg = BoardCalibrationDialog(self, self.state)
-        dlg.exec()
-        if dlg.saved_path:
-            self.e_calib.setText(dlg.saved_path)
-            self.save()
-            self.session = None
+    def swap(self):
+        if self.st.get('cam_b_unsynced') and not self.st.get('cam_b'):
+            self.st['cam_b'] = self.st.pop('cam_b_unsynced')
+        pl.swap_cameras(self.st)
+        self.session = None
+        self.refresh()
+        self.run_requested.emit(self.pid, self.day)
 
-    def click_calibration(self):
-        self.form_to_state()
-        if not (self.state['cam_a'] and self.state['cam_b']):
-            self.error('Choose both videos (and the sync offset) first.')
-            return
-        if not self.save():
-            return
-        dlg = CalibrationDialog(self, self.state)
-        if dlg.exec() and dlg.saved_path:
-            self.e_calib.setText(dlg.saved_path)
-            self.save()
+    # ---------- 1. videos ----------
+    def page_videos(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        f = QtWidgets.QHBoxLayout()
+        self.r_tc = QtWidgets.QRadioButton('by the GoPro timecodes (cameras synced in Quik)')
+        self.r_manual = QtWidgets.QRadioButton('by hand: camera B started')
+        self.s_offset = QtWidgets.QDoubleSpinBox()
+        self.s_offset.setRange(-3600, 3600)
+        self.s_offset.setDecimals(3)
+        self.s_offset.setSuffix(' s after camera A')
+        b = QtWidgets.QPushButton('Apply')
+        b.clicked.connect(self.apply_offset)
+        for x in (self.r_tc, self.r_manual, self.s_offset, b):
+            f.addWidget(x)
+        f.addStretch()
+        g = group('Line up the two videos', f)
+        v.addWidget(g)
+        v.addWidget(QtWidgets.QLabel(
+            'Before recording each day (and after changing a battery): sync both cameras in the GoPro Quik app '
+            '(Timecode Sync). A video without a timecode is analysed with one camera (2D).'))
+        v.addStretch()
+        self.edit_widgets += [b]
+        return w
 
-    # ---------- 2. Switches ----------
+    def refresh_videos(self):
+        st = self.st
+        manual = bool(st and st.get('offset_source') == 'manual')
+        self.r_manual.setChecked(manual)
+        self.r_tc.setChecked(not manual)
+        self.s_offset.setValue(st.get('offset_s', 0.0) if st else 0.0)
+
+    def apply_offset(self):
+        if self.st is None:
+            return
+        pl.set_offset(self.st, self.s_offset.value() if self.r_manual.isChecked() else None)
+        self.session = None
+        self.refresh()
+        self.run_requested.emit(self.pid, self.day)
+
+    # ---------- 2. calibration ----------
+    def page_calibration(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        f = QtWidgets.QHBoxLayout()
+        self.r_cal_auto = QtWidgets.QRadioButton('Find the board in the session videos')
+        self.s_cal_from = QtWidgets.QDoubleSpinBox()
+        self.s_cal_from.setRange(0, 600)
+        self.s_cal_from.setSuffix(' min')
+        self.s_cal_from.setDecimals(1)
+        self.s_cal_len = QtWidgets.QSpinBox()
+        self.s_cal_len.setRange(0, 1800)
+        self.s_cal_len.setSuffix(' s')
+        self.s_cal_len.setSpecialValueText('automatic')
+        self.s_cal_len.setToolTip('automatic: the first 3 minutes, then 3-7 minutes')
+        for x in (self.r_cal_auto, QtWidgets.QLabel('from'), self.s_cal_from, QtWidgets.QLabel('for'), self.s_cal_len):
+            f.addWidget(x)
+        f.addStretch()
+        v.addWidget(group('Where the ChArUco board is', f))
+        row = QtWidgets.QHBoxLayout()
+        b_apply = QtWidgets.QPushButton('Calibrate with this window')
+        b_apply.clicked.connect(self.apply_calib_window)
+        b_clips = QtWidgets.QPushButton('Board filmed in separate clips…')
+        b_clips.setToolTip('The board was filmed in 2 short clips (one per camera) without moving the cameras')
+        b_clips.clicked.connect(self.calib_clips)
+        b_file = QtWidgets.QPushButton('Use a calibration file…')
+        b_file.setToolTip('The calibration of an earlier recording - only if the cameras were not moved since')
+        b_file.clicked.connect(self.calib_file)
+        b_none = QtWidgets.QPushButton('No 3D (2D per camera)')
+        b_none.clicked.connect(self.calib_none)
+        for b in (b_apply, b_clips, b_file, b_none):
+            row.addWidget(b)
+        row.addStretch()
+        v.addLayout(row)
+        v.addWidget(QtWidgets.QLabel(
+            'For a good calibration: at the start of the session hold the board where both cameras see it and slowly '
+            'tilt and move it for 20-30 s (filling about 10-20 % of the picture).'))
+        v.addStretch()
+        self.edit_widgets += [b_apply, b_clips, b_file, b_none]
+        return w
+
+    def refresh_calibration(self):
+        c = (self.st or {}).get('calib') or {}
+        self.r_cal_auto.setChecked((self.st or {}).get('calibration_source', 'auto') == 'auto')
+        self.s_cal_from.setValue((c.get('start_s') or 0) / 60)
+        self.s_cal_len.setValue(int(c.get('seconds') or 0))
+
+    def apply_calib_window(self):
+        if self.st is None:
+            return
+        secs = self.s_cal_len.value()
+        self.st['calib'] = dict(start_s=self.s_cal_from.value() * 60 if secs else None, seconds=secs or None)
+        self.st['calibration_source'] = 'auto'
+        self.run_again_step('calibration')
+
+    def calib_clips(self):
+        if self.st is None:
+            return
+        paths = choose_videos(self)
+        if not paths or len(paths) != 2:
+            if paths is not None:
+                QtWidgets.QMessageBox.warning(self, 'Calibration', 'Choose the 2 board clips (one per camera).')
+            return
+        self.st['calib_clips'] = paths
+        self.st['calibration_source'] = 'clips'
+        self.run_again_step('calibration')
+
+    def calib_file(self):
+        if self.st is None:
+            return
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Calibration file (cameras not moved since)',
+                                                     pl.participant_dir(self.pid), 'JSON (*.json)')
+        if p:
+            self.st['calibration'] = p
+            self.st['calibration_source'] = 'file'
+            self.run_again_step('calibration')
+
+    def calib_none(self):
+        if self.st is None:
+            return
+        self.st['calibration'] = ''
+        self.st['calibration_source'] = 'none'
+        pl.set_status(self.st, 'calibration', pl.STATUS_SKIPPED, 'No 3D - each camera is analysed in 2D (chosen).')
+        pl.mark_todo(self.st, 'calibration', include_self=False)
+        self.save()
+        self.session = None
+        self.refresh()
+        self.run_requested.emit(self.pid, self.day)
+
+    def run_again_step(self, step):
+        pl.mark_todo(self.st, step)
+        self.save()
+        self.session = None
+        self.refresh()
+        self.run_requested.emit(self.pid, self.day)
+
+    # ---------- 3. switches ----------
     def page_switches(self):
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
@@ -612,24 +573,9 @@ class LabApp(QtWidgets.QMainWindow):
         self.c_swcam.addItems(['Camera A', 'Camera B'])
         self.c_swcam.currentIndexChanged.connect(self.refresh_switches)
         top.addWidget(self.c_swcam)
-        top.addWidget(QtWidgets.QLabel('  Look for the lights from'))
-        self.s_scan_from = QtWidgets.QDoubleSpinBox()
-        self.s_scan_from.setRange(0, 600)
-        self.s_scan_from.setSuffix(' min')
-        self.s_scan_len = QtWidgets.QDoubleSpinBox()
-        self.s_scan_len.setRange(0.5, 60)
-        self.s_scan_len.setValue(5)
-        self.s_scan_len.setSuffix(' min')
-        top.addWidget(self.s_scan_from)
-        top.addWidget(QtWidgets.QLabel('for'))
-        top.addWidget(self.s_scan_len)
-        b_find = QtWidgets.QPushButton('Find switches automatically')
-        b_find.clicked.connect(self.find_switches)
-        top.addWidget(b_find)
-        top.addStretch()
+        self.l_sw = QtWidgets.QLabel()
+        top.addWidget(self.l_sw, 1)
         v.addLayout(top)
-        self.l_sw = QtWidgets.QLabel('Switches are numbered 1-5 from the subject\'s RIGHT to LEFT.')
-        v.addWidget(self.l_sw)
         self.boxview = BoxView()
         self.boxview.box_drawn.connect(self.on_box_drawn)
         v.addWidget(self.boxview, 1)
@@ -638,872 +584,490 @@ class LabApp(QtWidgets.QMainWindow):
         b_flip.clicked.connect(self.flip_switches)
         self.s_swn = QtWidgets.QSpinBox()
         self.s_swn.setRange(1, ek.N_SWITCHES)
-        b_redraw = QtWidgets.QPushButton('Redraw switch')
+        self.s_swn.setPrefix('switch ')
+        b_redraw = QtWidgets.QPushButton('Redraw')
         b_redraw.clicked.connect(lambda: self.draw_box(self.s_swn.value() - 1))
+        b_del = QtWidgets.QPushButton('Remove')
+        b_del.clicked.connect(self.remove_switch)
         b_add = QtWidgets.QPushButton('Add a missing switch')
         b_add.clicked.connect(lambda: self.draw_box(None))
-        b_del = QtWidgets.QPushButton('Remove switch')
-        b_del.clicked.connect(self.remove_switch)
-        b_cancel = QtWidgets.QPushButton('Cancel')
-        b_cancel.clicked.connect(self.cancel)
-        for b in (b_flip, b_redraw, self.s_swn, b_add, b_del):
+        self.b_sw_done = QtWidgets.QPushButton('Done - continue')
+        self.b_sw_done.setStyleSheet('font-weight:bold;')
+        self.b_sw_done.clicked.connect(self.switches_done)
+        for b in (b_flip, self.s_swn, b_redraw, b_del, b_add):
             bot.addWidget(b)
+        bot.addSpacing(20)
+        bot.addWidget(QtWidgets.QLabel('Look for the lights from'))
+        self.s_scan_from = QtWidgets.QDoubleSpinBox()
+        self.s_scan_from.setRange(0, 600)
+        self.s_scan_from.setSuffix(' min')
+        self.s_scan_len = QtWidgets.QDoubleSpinBox()
+        self.s_scan_len.setRange(0.5, 60)
+        self.s_scan_len.setValue(5)
+        self.s_scan_len.setSuffix(' min')
+        b_find = QtWidgets.QPushButton('Find again')
+        b_find.clicked.connect(self.find_again)
+        for x in (self.s_scan_from, QtWidgets.QLabel('for'), self.s_scan_len, b_find):
+            bot.addWidget(x)
         bot.addStretch()
-        self.sw_bar = QtWidgets.QProgressBar()
-        self.sw_bar.setTextVisible(True)
-        bot.addWidget(self.sw_bar, 1)
-        bot.addWidget(b_cancel)
+        bot.addWidget(self.b_sw_done)
         v.addLayout(bot)
         self.redraw_index = None
+        self.boxes_edited = False
+        self.edit_widgets += [b_flip, b_redraw, b_del, b_add, b_find, self.b_sw_done]
         return w
 
-    def cur_cam(self):
+    def sw_cam(self):
         return 'b' if self.c_swcam.currentIndex() == 1 else 'a'
 
     def refresh_switches(self):
-        cam = self.cur_cam()
-        path = self.state.get(f'cam_{cam}')
-        self.s_scan_from.setValue(self.state.get('scan_start_s', 0) / 60)
-        self.s_scan_len.setValue(self.state.get('scan_minutes', 5))
-        if not path:
+        st = self.st
+        self.c_swcam.setEnabled(bool(st and st.get('cam_b')))
+        if st and not st.get('cam_b'):
+            self.c_swcam.setCurrentIndex(0)
+        cam = self.sw_cam()
+        if st is None or not st.get(f'cam_{cam}'):
             self.boxview.show_frame(None, None)
-            self.l_sw.setText(f'Choose the camera {cam.upper()} video on the Session page first.')
+            self.l_sw.setText('')
             return
-        boxes = self.state.get(f'boxes_{cam}')
-        self.boxview.show_frame(read_frame(path), boxes)
+        self.s_scan_from.setValue(st.get('scan_start_s', 0) / 60)
+        self.s_scan_len.setValue(st.get('scan_minutes', 5))
+        boxes = st.get(f'boxes_{cam}')
+        key = (st[f'cam_{cam}'], 0)
+        if getattr(self, '_frame_key', None) != key:
+            self._frame = read_frame(st[f'cam_{cam}'])
+            self._frame_key = key
+        self.boxview.show_frame(self._frame, boxes)
         n = len(boxes or [])
-        self.l_sw.setText(f'Camera {cam.upper()}: {n} of {ek.N_SWITCHES} switches. Numbered 1-5 from the '
-                          f"subject's RIGHT to LEFT - use Flip if it's the other way. A box should include the light.")
+        self.l_sw.setText(f'  {n} of {ek.N_SWITCHES} switches. Numbered 1-5 from the subject\'s RIGHT to LEFT - use '
+                          'Flip if it\'s the other way. A box should include the light.')
+        self.b_sw_done.setVisible(self.boxes_edited or st['steps']['switches']['status'] == pl.STATUS_ERROR)
 
-    def find_switches(self):
-        cam = self.cur_cam()
-        path = self.state.get(f'cam_{cam}')
-        if not path:
-            return
-        self.state['scan_start_s'] = self.s_scan_from.value() * 60
-        self.state['scan_minutes'] = self.s_scan_len.value()
-
-        def job(progress, stop):
-            cap = se.open_video(path)
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            ok, first = cap.read()
-            start = int(self.state['scan_start_s'] * fps)
-            bg, pink = ek.scan_video(cap, first, total, fps, lambda f: progress(f), start_frame=start,
-                                     max_frames=int(self.state['scan_minutes'] * 60 * fps), should_stop=stop)
-            return ek.find_switches(bg, pink)
-
-        def done(boxes):
-            self.state[f'boxes_{cam}'] = boxes
-            self.save()
-            self.refresh_switches()
-            if len(boxes) < ek.N_SWITCHES:
-                self.error(f'Found {len(boxes)} of {ek.N_SWITCHES} switches - draw the missing one(s) with '
-                           '"Add a missing switch", or look later in the video (lights must turn on while scanning).')
-        self.run_bg(job, done, 'Finding switches', self.sw_bar)
+    def set_boxes(self, boxes):
+        self.st[f'boxes_{self.sw_cam()}'] = boxes
+        self.boxes_edited = True
+        pl.mark_todo(self.st, 'switches', include_self=False)
+        self.save()
+        self.session = None
+        self.refresh_switches()
 
     def flip_switches(self):
-        cam = self.cur_cam()
-        if self.state.get(f'boxes_{cam}'):
-            self.state[f'boxes_{cam}'] = self.state[f'boxes_{cam}'][::-1]
-            self.save()
-            self.refresh_switches()
+        boxes = self.st.get(f'boxes_{self.sw_cam()}') if self.st else None
+        if boxes:
+            self.set_boxes(boxes[::-1])
 
     def draw_box(self, index):
+        if self.st is None:
+            return
         self.redraw_index = index
         self.boxview.start_drawing()
-        self.info('Drag a box around the switch (include its light).')
+        self.l_sw.setText('  Drag a box around the switch (include its light).')
 
     def on_box_drawn(self, box):
-        cam = self.cur_cam()
-        boxes = list(self.state.get(f'boxes_{cam}') or [])
+        boxes = list(self.st.get(f'boxes_{self.sw_cam()}') or [])
         if self.redraw_index is None:
             boxes = ek.sort_switches(boxes + [box])
         elif self.redraw_index < len(boxes):
             boxes[self.redraw_index] = box
         else:
             boxes.append(box)
-        self.state[f'boxes_{cam}'] = boxes
-        self.save()
-        self.refresh_switches()
+        self.set_boxes(boxes)
 
     def remove_switch(self):
-        cam = self.cur_cam()
-        boxes = list(self.state.get(f'boxes_{cam}') or [])
+        boxes = list(self.st.get(f'boxes_{self.sw_cam()}') or []) if self.st else []
         i = self.s_swn.value() - 1
         if i < len(boxes):
             boxes.pop(i)
-            self.state[f'boxes_{cam}'] = boxes
-            self.save()
-            self.refresh_switches()
+            self.set_boxes(boxes)
 
-    # ---------- 3. Process ----------
-    def page_process(self):
+    def switches_done(self):
+        """The boxes were edited by hand: they are the switches step's result; go on."""
+        missing = [c.upper() for c in pl.cameras_of(self.st) if len(self.st.get(f'boxes_{c}') or []) != ek.N_SWITCHES]
+        if missing:
+            QtWidgets.QMessageBox.warning(self, 'Switches', f'Camera {" and ".join(missing)} does not have '
+                                          f'{ek.N_SWITCHES} switches yet.')
+            return
+        self.boxes_edited = False
+        self.changed('switches', 'Switch boxes set by hand.')
+
+    def find_again(self):
+        if self.st is None:
+            return
+        self.st['scan_start_s'] = self.s_scan_from.value() * 60
+        self.st['scan_minutes'] = self.s_scan_len.value()
+        self.st['scan_custom'] = True
+        self.boxes_edited = False
+        self.run_again_step('switches')
+
+    # ---------- 4. processing ----------
+    def page_processing(self):
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
         v.addWidget(QtWidgets.QLabel(
-            'One pass over each video: MediaPipe on every frame, the switch lights, and where the hands/feet are.\n'
-            'This is the slow step (on a Mac roughly 1.5 x the video\'s length); it is saved, so it runs once per video.'))
-        self.l_proc = QtWidgets.QLabel()
-        self.l_proc.setTextFormat(Qt.RichText)
-        v.addWidget(self.l_proc)
-        row = QtWidgets.QHBoxLayout()
-        b = QtWidgets.QPushButton('Process')
-        b.setStyleSheet('font-weight:bold; padding:8px 24px;')
-        b.clicked.connect(self.process)
-        bc = QtWidgets.QPushButton('Cancel')
-        bc.clicked.connect(self.cancel)
-        row.addWidget(b)
-        row.addWidget(bc)
-        row.addStretch()
-        v.addLayout(row)
-        self.proc_bar = QtWidgets.QProgressBar()
-        self.proc_bar.setTextVisible(True)
-        v.addWidget(self.proc_bar)
+            'One pass over each video: MediaPipe on every frame, the switch lights, and where the hands / feet are.\n'
+            'This is the slow step (on a Mac about 1.5 x the video\'s length per camera). It is saved, so it runs '
+            'once per video - changing the switch boxes runs it again.'))
         v.addStretch()
         return w
 
-    def refresh_process(self):
-        lines = []
-        for cam in ('a', 'b'):
-            path = self.state.get(f'cam_{cam}')
-            if not path:
-                continue
-            boxes = self.state.get(f'boxes_{cam}')
-            c = se.load_cache(path, sa.session_dir(self.state), boxes) if boxes else None
-            if not boxes:
-                st = '<span style="color:#b00">switches not marked yet (step 2)</span>'
-            elif c is None:
-                st = 'not processed yet'
-            else:
-                st = (f'<span style="color:#080">processed: {c["meta"]["frames"]} frames</span>'
-                      + ('' if c['meta'].get('complete') else ' <b>(stopped early - process again)</b>'))
-            lines.append(f'<b>Camera {cam.upper()}</b> - {os.path.basename(path)}: {st}')
-        self.l_proc.setText('<br>'.join(lines) or 'Choose the video(s) on the Session page first.')
+    # ---------- 5. blocks & trials ----------
+    def page_analysis(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        self.tabs = QtWidgets.QTabWidget()
+        self.blocks = BlocksView()
+        self.blocks.parts_changed.connect(self.parts_changed)
+        self.trials = TrialsView()
+        self.trials.touse_changed.connect(self.touse_changed)
+        self.tabs.addTab(self.trials, 'Trials')
+        self.tabs.addTab(self.blocks, 'Blocks && parts')
+        v.addWidget(self.tabs)
+        self.loader = None
+        self.save_timer = QtCore.QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(1500)
+        self.save_timer.timeout.connect(lambda: self.run_requested.emit(self.pid, self.day))
+        return w
 
-    def process(self):
-        if not self.save():
-            return
-        todo = []
-        for cam in ('a', 'b'):
-            path, boxes = self.state.get(f'cam_{cam}'), self.state.get(f'boxes_{cam}')
-            if path and not boxes:
-                self.error(f'Mark the switches of camera {cam.upper()} first (step 2).')
-                return
-            if path:
-                c = se.load_cache(path, sa.session_dir(self.state), boxes)
-                if c is None or not c['meta'].get('complete'):
-                    todo.append((cam, path, boxes))
-        if not todo:
-            self.info('Already processed.')
-            return
-        out_dir = sa.session_dir(self.state)
-
-        def job(progress, stop):
-            for k, (cam, path, boxes) in enumerate(todo):
-                se.process_video(path, boxes, out_dir,
-                                 progress=lambda n, tot, left, k=k, cam=cam: progress(
-                                     (k + n / max(tot, 1)) / len(todo), f'camera {cam.upper()}'),
-                                 should_stop=stop)
-                if stop():
-                    break
-            return True
-
-        def done(_):
-            self.refresh_process()
+    def refresh_analysis(self):
+        self.blocks.set_editable(not self.busy)
+        if self.st is None or self.st['steps']['analysis']['status'] not in pl.DONE:
             self.session = None
-            self.info('Processing finished - go to "Blocks & parts".')
-        self.run_bg(job, done, 'Processing')
-
-    # ---------- 4. Blocks ----------
-    def page_blocks(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        self.l_blocks = QtWidgets.QLabel()
-        self.l_blocks.setWordWrap(True)
-        v.addWidget(self.l_blocks)
-        self.t_blocks = QtWidgets.QTableWidget(0, 5)
-        self.t_blocks.setHorizontalHeaderLabels(['Starts at', 'Trials found', 'Ends at', 'Part', 'Block # in part'])
-        self.t_blocks.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        v.addWidget(self.t_blocks, 1)
-        row = QtWidgets.QHBoxLayout()
-        b_apply = QtWidgets.QPushButton('Apply these parts')
-        b_apply.clicked.connect(self.apply_parts)
-        b_reset = QtWidgets.QPushButton('Back to the session plan')
-        b_reset.clicked.connect(self.reset_parts)
-        row.addWidget(b_apply)
-        row.addWidget(b_reset)
-        row.addStretch()
-        v.addLayout(row)
-        return w
-
-    def ensure_session(self):
-        if self.session is None or not self.session.ready or self.session.result is None:
-            self.load_session()
-        if self.session is None or not self.session.ready:
-            return False
-        return True
-
-    def refresh_blocks(self):
-        if not self.ensure_session():
-            self.l_blocks.setText('Process the video(s) first (step 3).')
-            self.t_blocks.setRowCount(0)
+            self.blocks.set_session(None)
+            self.trials.set_session(None)
             return
-        res = self.session.result
-        times = self.session.times
-        ev = res['events']
-        self.l_blocks.setText(
-            f"<b>{len(res['blocks'])} groups of lights found</b>, switch order in a sequence: "
-            f"<b>{', '.join(map(str, res['pattern'])) or '?'}</b>. "
-            + (('<br><span style="color:#b00">' + '<br>'.join(res['warnings']) + '</span>') if res['warnings'] else
-               '<br><span style="color:#080">Everything matches the session plan.</span>'))
-        self.l_blocks.setTextFormat(Qt.RichText)
-        self.t_blocks.setRowCount(len(res['blocks']))
-        for i, (b, (part, no)) in enumerate(zip(res['blocks'], res['parts'])):
-            on, off = ev[b[0]][1], ev[b[-1]][2] if ev[b[-1]][2] is not None else ev[b[-1]][1]
-            rows = [r for r in res['trials'] if r['block_index'] == i and r['on_frame'] is not None]
-            found = str(len(rows)) if part != ed.IGNORE else f'{len(b)} lights'
-            if rows and rows[-1]['off_frame'] is not None:
-                off = max(off, rows[-1]['off_frame'])
-            n_timing = sum(1 for r in rows if r.get('Light_source') == 'timing')
-            if n_timing:
-                found += f'  ({n_timing} from timing)'
-            for c, text in enumerate([mmss(times[on]), found, mmss(times[off])]):
-                it = QtWidgets.QTableWidgetItem(text)
-                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                self.t_blocks.setItem(i, c, it)
-            combo = QtWidgets.QComboBox()
-            combo.addItems(PART_CHOICES)
-            combo.setCurrentText(part)
-            self.t_blocks.setCellWidget(i, 3, combo)
-            spin = QtWidgets.QSpinBox()
-            spin.setRange(0, 50)
-            spin.setValue(no)
-            self.t_blocks.setCellWidget(i, 4, spin)
-
-    def apply_parts(self):
-        n = self.t_blocks.rowCount()
-        self.state['parts_override'] = [[self.t_blocks.cellWidget(i, 3).currentText(),
-                                         self.t_blocks.cellWidget(i, 4).value()] for i in range(n)]
-        self.save()
-        self.session = None
-        self.refresh_blocks()
-        self.info('Parts applied.')
-
-    def reset_parts(self):
-        self.state['parts_override'] = None
-        self.save()
-        self.session = None
-        self.refresh_blocks()
-
-    # ---------- 5. Trials ----------
-    def page_trials(self):
-        w = QtWidgets.QWidget()
-        h = QtWidgets.QHBoxLayout(w)
-        left = QtWidgets.QVBoxLayout()
-        flt = QtWidgets.QHBoxLayout()
-        self.f_part, self.f_block, self.f_seq = QtWidgets.QComboBox(), QtWidgets.QComboBox(), QtWidgets.QComboBox()
-        for lab, c in (('Part', self.f_part), ('Block', self.f_block), ('Sequence', self.f_seq)):
-            flt.addWidget(QtWidgets.QLabel(lab))
-            flt.addWidget(c)
-            c.currentIndexChanged.connect(self.fill_trials)
-        self.k_flagged = QtWidgets.QCheckBox('only marked trials')
-        self.k_flagged.toggled.connect(self.fill_trials)
-        flt.addWidget(self.k_flagged)
-        flt.addStretch()
-        left.addLayout(flt)
-        cols = ['Part', 'Blk', 'Seq', 'Trial', 'Target', 'Outcome', 'Light', 'Anticip.', 'Corrected', 'RT (s)', 'MT (s)',
-                'Data', 'touse']
-        self.t_trials = QtWidgets.QTableWidget(0, len(cols))
-        self.t_trials.setHorizontalHeaderLabels(cols)
-        self.t_trials.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.t_trials.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.t_trials.verticalHeader().setVisible(False)
-        self.t_trials.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        self.t_trials.itemSelectionChanged.connect(self.show_trial)
-        self.t_trials.itemChanged.connect(self.on_touse)
-        left.addWidget(self.t_trials, 1)
-        self.l_legend = QtWidgets.QLabel(
-            '<span style="background:#f8d7da">&nbsp;miss&nbsp;</span> '
-            '<span style="background:#fff3cd">&nbsp;started before the light&nbsp;</span> '
-            '<span style="background:#d1ecf1">&nbsp;corrected (went to another switch first)&nbsp;</span> '
-            '<span style="background:#e2e3e5">&nbsp;light not detected&nbsp;</span> - untick touse to leave a '
-            'trial out of the summaries')
-        self.l_legend.setTextFormat(Qt.RichText)
-        self.l_legend.setWordWrap(True)
-        left.addWidget(self.l_legend)
-        lw = QtWidgets.QWidget()
-        lw.setLayout(left)
-
-        right = QtWidgets.QVBoxLayout()
-        g = QtWidgets.QHBoxLayout()
-        self.c_graph = QtWidgets.QComboBox()
-        self.c_graph.addItems(['speed', 'x', 'y', 'z', 'path'])
-        self.c_graph.currentIndexChanged.connect(self.show_trial)
-        b_win = QtWidgets.QPushButton('Open graph in a new window')
-        b_win.clicked.connect(self.graph_window)
-        g.addWidget(QtWidgets.QLabel('Graph'))
-        g.addWidget(self.c_graph)
-        g.addWidget(b_win)
-        g.addStretch()
-        right.addLayout(g)
-        self.fig = Figure(figsize=(6, 3.2), tight_layout=True)
-        self.canvas = FigureCanvasQTAgg(self.fig)
-        right.addWidget(self.canvas, 2)
-        fr = QtWidgets.QHBoxLayout()
-        fr.addWidget(QtWidgets.QLabel('Video frame at:'))
-        self.frame_btns = {}
-        for key in ('light on', 'movement onset', 'movement end', 'trial end'):
-            b = QtWidgets.QPushButton(key)
-            b.clicked.connect(lambda _, k=key: self.show_video_frame(k))
-            fr.addWidget(b)
-        fr.addStretch()
-        right.addLayout(fr)
-        self.l_frame = QtWidgets.QLabel()
-        self.l_frame.setAlignment(Qt.AlignCenter)
-        self.l_frame.setMinimumHeight(240)
-        right.addWidget(self.l_frame, 2)
-        rw = QtWidgets.QWidget()
-        rw.setLayout(right)
-        split = QtWidgets.QSplitter()
-        split.addWidget(lw)
-        split.addWidget(rw)
-        split.setSizes([700, 600])
-        h.addWidget(split)
-        self.shown_rows = []
-        return w
-
-    def refresh_trials(self):
-        if not self.ensure_session():
-            self.t_trials.setRowCount(0)
+        if self.session is not None:
             return
-        trials = self.session.result['trials']
-        for c, key in ((self.f_part, 'Part'), (self.f_block, 'Block'), (self.f_seq, 'Sequence')):
-            cur = c.currentText()
-            c.blockSignals(True)
-            c.clear()
-            vals = list(dict.fromkeys(str(r[key]) for r in trials))
-            c.addItems(['All'] + vals)
-            c.setCurrentText(cur if cur in vals else 'All')
-            c.blockSignals(False)
-        self.fill_trials()
-
-    def fill_trials(self, *_):
-        if self.session is None or self.session.result is None:
+        if self.loader is not None and self.loader.isRunning():
             return
-        sel = lambda c: None if c.currentText() in ('', 'All') else c.currentText()
-        p, b, s = sel(self.f_part), sel(self.f_block), sel(self.f_seq)
-        rows = [r for r in self.session.result['trials']
-                if (p is None or r['Part'] == p) and (b is None or str(r['Block']) == b)
-                and (s is None or str(r['Sequence']) == s)]
-        if self.k_flagged.isChecked():
-            rows = [r for r in rows if r['Outcome'] != 'hit' or r['anticipation'] or r['corrected_from']]
-        self.shown_rows = rows
-        t = self.t_trials
-        t.blockSignals(True)
-        t.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            vals = [r['Part'], r['Block'], r['Sequence'], r['Trial'], r['Target'], r['Outcome'],
-                    r.get('Light_source', ''),
-                    f"yes ({r['anticipation_ms']:.0f} ms)" if r['anticipation'] else '',
-                    f"from {r['corrected_from']}" if r['corrected_from'] else '',
-                    fmt(r['responsetime']), fmt(r['movementtime']), r.get('Data', '')]
-            color = (FLAG_COLOR.get(r['Outcome']) or (FLAG_COLOR['anticipation'] if r['anticipation'] else None)
-                     or (FLAG_COLOR['corrected'] if r['corrected_from'] else None))
-            for c, val in enumerate(vals):
-                it = QtWidgets.QTableWidgetItem(str(val))
-                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                if color:
-                    it.setBackground(QtGui.QColor(color))
-                t.setItem(i, c, it)
-            it = QtWidgets.QTableWidgetItem()
-            it.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            it.setCheckState(Qt.Checked if r['touse'] else Qt.Unchecked)
-            t.setItem(i, len(vals), it)
-        t.blockSignals(False)
+        st = dict(self.st)
 
-    def on_touse(self, item):
-        if item.column() != self.t_trials.columnCount() - 1 or item.row() >= len(self.shown_rows):
-            return
-        self.session.set_touse(self.shown_rows[item.row()], item.checkState() == Qt.Checked)
+        def job(progress, stop):
+            s = sa.Session(st)
+            s.analyze()
+            return s
 
-    def current_trial(self):
-        rows = self.t_trials.selectionModel().selectedRows()
-        return self.shown_rows[rows[0].row()] if rows and rows[0].row() < len(self.shown_rows) else None
-
-    def plot_trial(self, fig, r):
-        fig.clear()
-        ax = fig.add_subplot(111)
-        if r is None:
-            return
-        k, m = self.session.trial_curves(r)
-        if k is None:
-            ax.text(0.5, 0.5, 'no movement data for this trial', ha='center', transform=ax.transAxes)
-            return
-        t = k['time'] - k['stim']
-        rel = lambda x: x - k['stim'] if x is not None and not np.isnan(x) else None
-        kind = self.c_graph.currentText()
-        on_i = end_i = None
-        if m and not np.isnan(m.get('onset_s', np.nan)):
-            on_i, end_i = np.searchsorted(k['time'], m['onset_s']), np.searchsorted(k['time'], m['end_s'])
-        if kind == 'path':
-            xyz = k['xyz']
-            ax.plot(xyz[:, 0], xyz[:, 1], '.', color='0.6', ms=3)
-            if on_i is not None:
-                ax.plot(xyz[on_i:end_i + 1, 0], xyz[on_i:end_i + 1, 1], '-', lw=2.5, color='C0', label='movement')
-            sp = self.session.trial_switch_pos(r)
-            ax.scatter(sp[:, 0], sp[:, 1], marker='s', s=60, color='0.3')
-            for i, p in enumerate(sp):
-                ax.annotate(str(i + 1), p[:2], color='C3' if i + 1 == r['Target'] else '0.3', fontsize=12,
-                            fontweight='bold', xytext=(6, 6), textcoords='offset points')
-            if xyz.shape[1] == 2:
-                ax.invert_yaxis()
-            ax.set_aspect('equal', 'datalim')
-            ax.set_xlabel('x')
-            ax.set_ylabel('y')
-        else:
-            y = k['tangvel'] if kind == 'speed' else k['xyz'][:, 'xyz'.index(kind)] if 'xyz'.index(kind) < k['xyz'].shape[1] else None
-            if y is None:
-                ax.text(0.5, 0.5, 'z needs two cameras', ha='center', transform=ax.transAxes)
+        def done(s):
+            if self.st is None or s.state.get('subject') != self.pid:
                 return
-            ax.plot(t, y, '.', color='0.5', ms=3)
-            if on_i is not None:
-                ax.plot(t[on_i:end_i + 1], y[on_i:end_i + 1], '-', lw=2.5, color='C0')
-            ax.axvline(0, color='k', ls='--', label='light on')
-            if m and rel(m.get('onset_s')) is not None:
-                ax.axvline(rel(m['onset_s']), color='r', ls='--', label='movement onset')
-                ax.axvline(rel(m['end_s']), color='b', ls='--', label='movement end')
-            end_ms = r.get('Trial_end_ms')
-            if end_ms is not None:
-                ax.axvline(end_ms / 1000 - k['stim'], color='g', ls='-', label='hit' if r['Outcome'] == 'hit' else 'light off')
-            ax.set_xlabel('time from light on (s)')
-            ax.set_ylabel('speed' if kind == 'speed' else kind)
-            ax.legend(loc='upper left', fontsize=8)
-        ax.set_title(f"{r['Part']}  block {r['Block']}  seq {r['Sequence']}  trial {r['Trial']}  → switch {r['Target']}"
-                     f"   RT {fmt(r['responsetime'])} s  MT {fmt(r['movementtime'])} s", fontsize=9)
-        if not r['touse']:
-            ax.set_facecolor('0.85')
+            s.state = self.st            # touse choices are saved into the day's state
+            self.session = s
+            self.blocks.set_session(s)
+            self.trials.set_session(s)
+        self.blocks.label.setText('Loading the analysis…')
+        self.loader = Worker(job)
+        self.loader.done.connect(done)
+        self.loader.failed.connect(lambda m: self.blocks.label.setText(f'Could not load the analysis: {m}'))
+        self.loader.start()
 
-    def show_trial(self):
-        r = self.current_trial()
-        self.plot_trial(self.fig, r)
-        self.canvas.draw_idle()
-        if r is not None:
-            self.show_video_frame('movement onset' if r.get('onset_s') else 'light on')
+    def parts_changed(self, parts):
+        self.st['parts_override'] = parts
+        self.run_again_step('analysis')
 
-    def graph_window(self):
-        r = self.current_trial()
-        if r is None:
-            return
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle('Trial graph')
-        dlg.resize(1000, 600)
-        fig = Figure(tight_layout=True)
-        lay = QtWidgets.QVBoxLayout(dlg)
-        lay.addWidget(FigureCanvasQTAgg(fig))
-        self.plot_trial(fig, r)
-        dlg.show()
+    def touse_changed(self):
+        pl.mark_todo(self.st, 'results')
+        self.save()
+        self.refresh_buttons_only()
+        if not self.app.running():
+            self.save_timer.start()
 
-    def show_video_frame(self, which):
-        r = self.current_trial()
-        if r is None or r.get('on_frame') is None:
-            self.l_frame.clear()
-            return
-        times = self.session.times
-        if which == 'light on':
-            f = r['on_frame']
-        elif which == 'trial end':
-            f = r['off_frame'] if r['off_frame'] is not None else r['on_frame']
-        else:
-            t = r.get('onset_s' if which == 'movement onset' else 'end_s')
-            if t is None or np.isnan(t):
-                return
-            f = int(np.clip(np.searchsorted(times, t * 1000), 0, len(times) - 1))
-        prefer = {'camera A': 'a', 'camera B': 'b'}.get(r.get('Data'), 'a')
-        cam, cf = self.session.frame_ref(f, prefer)
-        if cam is None:
-            return
-        frame = read_frame(self.state[f'cam_{cam}'], cf)
-        if frame is None:
-            return
-        cache = self.session.cams[cam]
-        # Marker and target
-        j = {'upper': {'right': 16, 'left': 15}, 'lower': {'right': 28, 'left': 27}}[r['Limb']][r['Side']]
-        p = cache['pose'][cf, j]
-        sc = max(frame.shape[:2]) / 1280
-        if not np.isnan(p[0]):
-            cv2.drawMarker(frame, (int(p[0]), int(p[1])), (0, 0, 255), cv2.MARKER_CROSS, int(40 * sc), int(4 * sc))
-        w, h = cache['meta']['size']
-        b = self.state[f'boxes_{cam}'][r['Target'] - 1]
-        M = cache['motion'][cf]
-        c = ek.box_corners(b, w, h, 0.0) @ M[:, :2].T + M[:, 2]
-        cv2.polylines(frame, [c.astype(np.int32)], True, (0, 212, 255), int(3 * sc))
-        which = f'camera {cam.upper()}: {which}'
-        cv2.putText(frame, f'{which}  {mmss(times[f])}', (int(20 * sc), int(50 * sc)), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2 * sc, (255, 255, 255), int(3 * sc))
-        pix = to_pixmap(frame)
-        self.l_frame.setPixmap(pix.scaled(self.l_frame.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    def refresh_buttons_only(self):
+        for s, b in self.step_buttons.items():
+            bg, fg, mark = STATUS_STYLE[self.st['steps'][s]['status']]
+            b.setText(f'{mark}{pl.STEPS.index(s) + 1}. {pl.STEP_NAMES[s]}'.replace('&', '&&'))
+            b.setStyleSheet(f'QPushButton{{background:{bg}; color:{fg}; border:1px solid #ced4da; border-radius:4px;}}'
+                            f'QPushButton:checked{{border:2px solid #0d6efd; font-weight:bold;}}')
 
-    # ---------- 6. Export ----------
-    def page_export(self):
+    # ---------- 6. results ----------
+    def page_results(self):
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
         v.addWidget(QtWidgets.QLabel(
-            '<b>This session</b><br>'
-            '&nbsp;• <i>trials.csv</i>: every trial synced with the design - part, block, sequence, trial, target, '
-            'light on, touch, hit, light off, trial end, outcome (hit / miss), started before the light '
-            '(anticipation), corrected (first went to another switch)<br>'
-            '&nbsp;• <i>analysis.xlsx</i>: reaction time, movement time (+ AT, DT, peaks, straightness) per trial, and '
-            'mean / median / SD / IQR by part, block and sequence (familiarization and touse = 0 left out)'))
-        b1 = QtWidgets.QPushButton('Save this session\'s CSV + Excel')
-        b1.clicked.connect(self.export_session)
-        v.addWidget(b1)
-        v.addSpacing(20)
-        v.addWidget(QtWidgets.QLabel('<b>All subjects</b><br>One Excel file with every saved session in the '
-                                     'results folder (day 1 and re-test day of a subject together).'))
-        b2 = QtWidgets.QPushButton('Make the all-subjects Excel')
-        b2.clicked.connect(self.export_all)
-        v.addWidget(b2)
-        self.l_export = QtWidgets.QLabel()
-        self.l_export.setTextFormat(Qt.RichText)
-        self.l_export.setOpenExternalLinks(True)
-        self.l_export.setWordWrap(True)
-        v.addWidget(self.l_export)
-        b3 = QtWidgets.QPushButton('Open the results folder')
-        b3.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(sa.RESULTS_DIR)))
-        v.addWidget(b3)
+            '<b>trials.csv</b>: every trial synced with the design - part, block, sequence, trial, target, light on, '
+            'touch, hit, light off, trial end, outcome, started before the light, corrected, not from home.<br>'
+            '<b>analysis.xlsx</b>: RT, MT (+ AT, DT, peaks, straightness) per trial, and mean / median / SD / IQR by '
+            'part, block and sequence (familiarization and touse = 0 left out).<br>'
+            '<b>analysis_all_subjects.xlsx</b> (in the results folder): every participant, both days.'))
+        row = QtWidgets.QHBoxLayout()
+        b1 = QtWidgets.QPushButton('Open this day\'s folder')
+        b1.clicked.connect(lambda: open_folder(pl.day_dir(self.pid, self.day)))
+        b2 = QtWidgets.QPushButton('Open the results folder')
+        b2.clicked.connect(lambda: open_folder(sa.RESULTS_DIR))
+        row.addWidget(b1)
+        row.addWidget(b2)
+        row.addStretch()
+        v.addLayout(row)
         v.addStretch()
         return w
 
-    def export_session(self):
-        if not self.ensure_session():
-            self.error('Process the video(s) first.')
-            return
-        paths = self.session.write_outputs()
-        self.l_export.setText('Saved:<br>' + '<br>'.join(f'<a href="file://{p}">{p}</a>' for p in paths))
 
-    def export_all(self):
-        path, n = sa.export_all()
-        self.l_export.setText(f'Saved ({n} subjects): <a href="file://{path}">{path}</a>')
+def open_folder(path):
+    os.makedirs(path, exist_ok=True)
+    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
 
 
 # -----------------------------
-# Board calibration
+# Main window
 # -----------------------------
-class BoardCalibrationDialog(QtWidgets.QDialog):
-    """The printed ChArUco board filmed by both cameras -> lenses + where camera B is (real units, cm)."""
-
-    def __init__(self, parent, state):
-        super().__init__(parent)
-        import calibrate_cameras as cc
-        self.cc, self.state, self.saved_path, self.worker = cc, state, None, None
-        self.setWindowTitle('Board calibration')
-        self.resize(820, 620)
-        v = QtWidgets.QVBoxLayout(self)
-        v.addWidget(QtWidgets.QLabel(
-            f'The ChArUco board ({cc.BOARD_SQUARES[0]} x {cc.BOARD_SQUARES[1]} squares, printed at 100% on A4) held '
-            'where both cameras see it and slowly tilted / moved around the subject\'s area for ~20-30 s.'))
-        self.r_session = QtWidgets.QRadioButton('The session videos')
-        self.r_clips = QtWidgets.QRadioButton('Separate calibration clips (same camera positions)')
-        self.r_session.setChecked(True)
-        f = QtWidgets.QFormLayout()
-        f.addRow(self.r_session)
-        self.s_start = QtWidgets.QDoubleSpinBox()
-        self.s_start.setRange(0, 36000)
-        self.s_start.setSuffix(' s')
-        self.s_len = QtWidgets.QDoubleSpinBox()
-        self.s_len.setRange(5, 36000)
-        self.s_len.setValue(60)
-        self.s_len.setSuffix(' s')
-        tw = QtWidgets.QHBoxLayout()
-        tw.addWidget(QtWidgets.QLabel('look from'))
-        tw.addWidget(self.s_start)
-        tw.addWidget(QtWidgets.QLabel('(video A time) for'))
-        tw.addWidget(self.s_len)
-        tw.addStretch()
-        f.addRow('   Time window', tw)
-        f.addRow(self.r_clips)
-        self.e_ca, self.e_cb = QtWidgets.QLineEdit(), QtWidgets.QLineEdit()
-        f.addRow('   Clip camera A', path_row(self.e_ca, lambda: self.browse(self.e_ca)))
-        f.addRow('   Clip camera B', path_row(self.e_cb, lambda: self.browse(self.e_cb)))
-        self.s_off = QtWidgets.QDoubleSpinBox()
-        self.s_off.setRange(-36000, 36000)
-        self.s_off.setDecimals(4)
-        self.s_off.setSuffix(' s')
-        b_tc = QtWidgets.QPushButton('From timecode')
-        b_tc.clicked.connect(self.clip_offset)
-        orow = QtWidgets.QHBoxLayout()
-        orow.addWidget(self.s_off)
-        orow.addWidget(b_tc)
-        orow.addWidget(QtWidgets.QLabel('seconds into clip A at which clip B started'))
-        orow.addStretch()
-        f.addRow('   Clip offset', orow)
-        self.s_sq = QtWidgets.QDoubleSpinBox()
-        self.s_sq.setRange(10, 100)
-        self.s_sq.setDecimals(1)
-        self.s_sq.setValue(cc.BOARD_SQUARE_MM)
-        self.s_sq.setSuffix(' mm')
-        f.addRow('Measured square size', self.s_sq)
-        self.s_ps = QtWidgets.QDoubleSpinBox()
-        self.s_ps.setRange(1, 30)
-        self.s_ps.setValue(4)
-        f.addRow('Frames checked per second', self.s_ps)
-        v.addLayout(f)
-        row = QtWidgets.QHBoxLayout()
-        self.b_run = QtWidgets.QPushButton('Run')
-        self.b_run.setStyleSheet('font-weight:bold; padding:6px 20px;')
-        self.b_run.clicked.connect(self.run)
-        b_stop = QtWidgets.QPushButton('Cancel')
-        b_stop.clicked.connect(self.stop)
-        b_close = QtWidgets.QPushButton('Close')
-        b_close.clicked.connect(self.accept)
-        self.bar = QtWidgets.QProgressBar()
-        self.bar.setRange(0, 1000)
-        self.bar.setTextVisible(True)
-        row.addWidget(self.b_run)
-        row.addWidget(b_stop)
-        row.addWidget(self.bar, 1)
-        row.addWidget(b_close)
-        v.addLayout(row)
-        self.out = QtWidgets.QPlainTextEdit()
-        self.out.setReadOnly(True)
-        self.out.setStyleSheet('font-family: Menlo, Consolas, monospace;')
-        v.addWidget(self.out, 1)
-
-    def browse(self, edit):
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Calibration clip (GoPro: the first chapter)', '',
-                                                     'Videos (*.mov *.mp4 *.MOV *.MP4)')
-        if p:
-            edit.setText(vs.first_chapter(p))
-
-    def clip_offset(self):
-        import timecode
-        try:
-            off, ta, tb = timecode.timecode_offset(self.e_ca.text().strip(), self.e_cb.text().strip())
-            self.s_off.setValue(off)
-            self.out.setPlainText(f"Clip offset from the timecodes: {off:+.4f} s (A {ta['timecode']}, B {tb['timecode']})")
-        except Exception as e:
-            self.out.setPlainText(f'Could not read the timecodes: {e}')
-
-    def run(self):
-        if self.worker is not None and self.worker.isRunning():
-            return
-        if self.r_session.isChecked():
-            a, b, off = self.state['cam_a'], self.state.get('cam_b'), self.state.get('offset_s', 0.0)
-            start, length = self.s_start.value(), self.s_len.value()
-        else:
-            a, b, off = self.e_ca.text().strip(), self.e_cb.text().strip(), self.s_off.value()
-            start, length = 0.0, 0.0
-        if not (a and b and os.path.exists(a) and os.path.exists(b)):
-            self.out.setPlainText('Choose both videos first (Session step, or the clips here).')
-            return
-        sq, ps = self.s_sq.value(), self.s_ps.value()
-        self.out.setPlainText(f'Looking for the board in {os.path.basename(a)} and {os.path.basename(b)} '
-                              f'(offset {off:+.4f} s)...')
-
-        def job(progress, stop):
-            return self.cc.calibrate_board(a, b, off, sq, start, length, ps, progress=progress, should_stop=stop)
-
-        def done(res):
-            path = os.path.join(sa.session_dir(self.state), 'cameras_board.json')
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            self.cc.save_board_calibration(path, res, a, b)
-            self.saved_path = path
-            self.out.setPlainText(self.cc.board_report(res) + f'\n\nSaved: {path}\nand set as this session\'s '
-                                  'calibration.')
-            self.bar.setValue(1000)
-            self.bar.setFormat('done - PASS' if res['ok'] else 'done - with warnings')
-
-        self.worker = Worker(job)
-        self.worker.progress.connect(lambda f, t: (self.bar.setValue(int(f * 1000)), self.bar.setFormat(f'{f:.0%}  {t}')))
-        self.worker.done.connect(done)
-        self.worker.failed.connect(lambda m: (self.out.setPlainText(f'Calibration failed:\n{m}'),
-                                              self.bar.setFormat('failed')))
-        self.worker.start()
-
-    def stop(self):
-        if self.worker is not None:
-            self.worker.stop_requested = True
-
-    def reject(self):
-        self.stop()
-        super().reject()
-
-
-# -----------------------------
-# Two-camera click calibration
-# -----------------------------
-class ClickView(QtWidgets.QLabel):
-    clicked = Signal(float, float)
+class LabApp(QtWidgets.QMainWindow):
+    """Participants and the queue on the left; the chosen participant's days on the right."""
 
     def __init__(self):
         super().__init__()
-        self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(500, 300)
-        self.img = None
-        self.points = []
+        self.setWindowTitle('Reaching Lab')
+        self.resize(1450, 920)
+        self.runner = None
+        split = QtWidgets.QSplitter()
+        self.setCentralWidget(split)
 
-    def set_image(self, bgr):
-        self.img = bgr
-        self.redraw()
-
-    def redraw(self):
-        if self.img is None:
-            return
-        im = self.img.copy()
-        sc = max(im.shape[:2]) / 1280
-        for i, (x, y) in enumerate(self.points):
-            cv2.drawMarker(im, (int(x), int(y)), (0, 255, 255), cv2.MARKER_CROSS, int(30 * sc), int(3 * sc))
-            cv2.putText(im, str(i + 1), (int(x + 12 * sc), int(y - 12 * sc)), cv2.FONT_HERSHEY_SIMPLEX, 1.1 * sc,
-                        (0, 255, 255), int(3 * sc))
-        self.setPixmap(to_pixmap(im).scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        self.redraw()
-
-    def mousePressEvent(self, e):
-        if self.img is None or self.pixmap() is None:
-            return
-        pm = self.pixmap()
-        ox, oy = (self.width() - pm.width()) / 2, (self.height() - pm.height()) / 2
-        x, y = (e.position().x() - ox) / pm.width() * self.img.shape[1], (e.position().y() - oy) / pm.height() * self.img.shape[0]
-        if 0 <= x < self.img.shape[1] and 0 <= y < self.img.shape[0]:
-            self.clicked.emit(x, y)
-
-
-class CalibrationDialog(QtWidgets.QDialog):
-    """Click the same points in both camera views (same moment) -> where camera B is relative to camera A."""
-
-    def __init__(self, parent, state):
-        super().__init__(parent)
-        self.setWindowTitle('Two-camera calibration - click the same point in A, then in B')
-        self.resize(1500, 800)
-        self.state = state
-        self.saved_path = None
-        self.cap_a, self.cap_b = vs.VideoSource(state['cam_a'], False), vs.VideoSource(state['cam_b'], False)
-        self.fps_a = self.cap_a.get(cv2.CAP_PROP_FPS) or 30
-        self.first = [read_frame(state['cam_a']), read_frame(state['cam_b'])]
-        v = QtWidgets.QVBoxLayout(self)
-        v.addWidget(QtWidgets.QLabel(
-            'Click a point in A (left), then the same point in B (right). Good points: centres of the red buttons, '
-            'label corners, table corners, and the subject at this moment (knuckle, elbow) - not all on the table. '
-            'At least 8 pairs, 12-20 is better.'))
-        tl = QtWidgets.QHBoxLayout()
-        tl.addWidget(QtWidgets.QLabel('Moment (video A)'))
-        self.slider = QtWidgets.QSlider(Qt.Horizontal)
-        n = int(self.cap_a.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.slider.setRange(0, max(0, n - 1))
-        self.slider.setEnabled(True)
-        self.slider.sliderReleased.connect(self.load_frames)
-        tl.addWidget(self.slider, 1)
-        self.l_time = QtWidgets.QLabel('0:00')
-        tl.addWidget(self.l_time)
-        v.addLayout(tl)
-        hv = QtWidgets.QHBoxLayout()
-        self.va, self.vb = ClickView(), ClickView()
-        self.va.clicked.connect(lambda x, y: self.on_click('a', x, y))
-        self.vb.clicked.connect(lambda x, y: self.on_click('b', x, y))
-        hv.addWidget(self.va)
-        hv.addWidget(self.vb)
-        v.addLayout(hv, 1)
+        left = QtWidgets.QWidget()
+        lv = QtWidgets.QVBoxLayout(left)
+        lv.addWidget(QtWidgets.QLabel('<b>Participants</b>'))
+        self.list = QtWidgets.QListWidget()
+        self.list.currentItemChanged.connect(self.on_select)
+        lv.addWidget(self.list, 1)
+        b_new = QtWidgets.QPushButton('New participant…')
+        b_new.clicked.connect(self.new_participant)
+        lv.addWidget(b_new)
+        lv.addSpacing(10)
+        lv.addWidget(QtWidgets.QLabel('<b>Queue</b>'))
+        self.b_run_all = QtWidgets.QPushButton('Run all')
+        self.b_run_all.setToolTip('Run every day that still has steps to do, one after the other (e.g. overnight)')
+        self.b_run_all.setStyleSheet('font-weight:bold; padding:6px;')
+        self.b_run_all.clicked.connect(self.run_all)
+        self.b_stop = QtWidgets.QPushButton('Stop')
+        self.b_stop.setEnabled(False)
+        self.b_stop.clicked.connect(self.stop)
         row = QtWidgets.QHBoxLayout()
-        self.l_info = QtWidgets.QLabel()
-        row.addWidget(self.l_info, 1)
-        row.addWidget(QtWidgets.QLabel('Lens (35 mm equiv.)'))
-        self.s_focal = QtWidgets.QDoubleSpinBox()
-        self.s_focal.setRange(10, 100)
-        self.s_focal.setValue(28)
-        row.addWidget(self.s_focal)
-        for text, fn in (('Undo', self.undo), ('Compute and save', self.compute), ('Close', self.reject)):
-            b = QtWidgets.QPushButton(text)
-            b.clicked.connect(fn)
-            row.addWidget(b)
-        v.addLayout(row)
-        self.pts = {'a': [], 'b': []}   # first-frame coordinates
-        self.motion = {'a': None, 'b': None}
-        self.load_frames()
+        row.addWidget(self.b_run_all, 1)
+        row.addWidget(self.b_stop)
+        lv.addLayout(row)
+        self.l_queue = QtWidgets.QLabel('Idle.')
+        self.l_queue.setWordWrap(True)
+        lv.addWidget(self.l_queue)
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(True)
+        lv.addWidget(self.bar)
+        b_all = QtWidgets.QPushButton('Make the all-participants Excel')
+        b_all.clicked.connect(self.export_all)
+        lv.addWidget(b_all)
+        split.addWidget(left)
 
-    def load_frames(self):
-        fa = self.slider.value()
-        t = fa / self.fps_a
-        fb = int(round((t - self.state.get('offset_s', 0)) * (self.cap_b.get(cv2.CAP_PROP_FPS) or 30)))
-        self.l_time.setText(f'{int(t // 60)}:{t % 60:05.2f}')
-        frames = []
-        for cam, cap, idx, first in (('a', self.cap_a, fa, self.first[0]), ('b', self.cap_b, max(0, fb), self.first[1])):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ok, fr = cap.read()
-            fr = fr if ok else first
-            cm = ek.CameraMotion(first)
-            cm.update(fr)
-            self.motion[cam] = cm.M
-            frames.append(fr)
-        self.va.set_image(frames[0])
-        self.vb.set_image(frames[1])
-        self.redraw_points()
+        right = QtWidgets.QWidget()
+        rv = QtWidgets.QVBoxLayout(right)
+        head = QtWidgets.QHBoxLayout()
+        self.l_head = QtWidgets.QLabel()
+        self.l_head.setTextFormat(Qt.RichText)
+        self.l_head.setWordWrap(True)
+        head.addWidget(self.l_head, 1)
+        self.b_design = QtWidgets.QPushButton('Design && settings…')
+        self.b_design.clicked.connect(self.edit_design)
+        head.addWidget(self.b_design)
+        rv.addLayout(head)
+        self.day_tabs = QtWidgets.QTabWidget()
+        self.days = {}
+        for day in pl.DAYS:
+            dv = DayView(self, day)
+            dv.run_requested.connect(self.run_day)
+            self.days[day] = dv
+            self.day_tabs.addTab(dv, pl.DAY_NAMES[day])
+        rv.addWidget(self.day_tabs, 1)
+        self.empty = QtWidgets.QLabel('Add a participant with "New participant…" on the left.')
+        self.empty.setAlignment(Qt.AlignCenter)
+        self.stack = QtWidgets.QStackedWidget()
+        self.stack.addWidget(self.empty)
+        self.stack.addWidget(right)
+        split.addWidget(self.stack)
+        split.setSizes([280, 1170])
+        QtGui.QShortcut(QtGui.QKeySequence('Escape'), self, activated=self.stop)
+        pl.recover_interrupted()
+        self.refresh_list()
+        if self.list.count():
+            self.list.setCurrentRow(0)
 
-    def to_first(self, cam, x, y):
-        inv = cv2.invertAffineTransform(self.motion[cam])
-        return inv[:, :2] @ np.array([x, y]) + inv[:, 2]
+    # ---------- participants ----------
+    def pid(self):
+        it = self.list.currentItem()
+        return it.data(Qt.UserRole) if it else None
 
-    def to_current(self, cam, p):
-        M = self.motion[cam]
-        return M[:, :2] @ np.asarray(p) + M[:, 2]
+    def refresh_list(self):
+        cur = self.pid()
+        self.list.blockSignals(True)
+        self.list.clear()
+        running = self.runner.current if self.running() else None
+        for pid in pl.list_participants():
+            marks = []
+            for day in pl.DAYS:
+                try:
+                    s = pl.day_summary(pl.load_day(pid, day)) if pl.day_exists(pid, day) else 'empty'
+                except (ValueError, OSError):
+                    s = 'error'
+                if running == (pid, day):
+                    s = 'running'
+                marks.append(f'{"D1" if day == "d1" else "D2"} {SUMMARY_MARK[s]}')
+            it = QtWidgets.QListWidgetItem(f'{pid}     ' + '   '.join(marks))
+            it.setData(Qt.UserRole, pid)
+            self.list.addItem(it)
+            if pid == cur:
+                self.list.setCurrentItem(it)
+        self.list.blockSignals(False)
 
-    def on_click(self, cam, x, y):
-        want = 'a' if len(self.pts['a']) == len(self.pts['b']) else 'b'
-        if cam != want:
-            self.l_info.setText(f'Next click goes in {want.upper()}.')
+    def on_select(self, *_):
+        pid = self.pid()
+        self.stack.setCurrentIndex(1 if pid else 0)
+        if not pid:
             return
-        self.pts[cam].append(self.to_first(cam, x, y))
-        self.redraw_points()
-
-    def undo(self):
-        if len(self.pts['a']) > len(self.pts['b']):
-            self.pts['a'].pop()
-        elif self.pts['b']:
-            self.pts['b'].pop()
-        self.redraw_points()
-
-    def redraw_points(self):
-        self.va.points = [self.to_current('a', p) for p in self.pts['a']]
-        self.vb.points = [self.to_current('b', p) for p in self.pts['b']]
-        self.va.redraw()
-        self.vb.redraw()
-        n = len(self.pts['b'])
-        self.l_info.setText(f'{n} pairs. Next: click in {"A" if len(self.pts["a"]) == n else "B"}. '
-                            'Move the slider to use other moments too (the subject in other positions).')
-
-    def compute(self):
-        n = len(self.pts['b'])
-        if n < 8:
-            QtWidgets.QMessageBox.warning(self, 'Calibration', f'{n} pairs - need at least 8.')
+        try:
+            p = pl.load_participant(pid)
+        except Exception as e:
+            self.l_head.setText(f'<span style="color:#b00">{e}</span>')
             return
-        import calibrate_cameras as cc
-        pa, pb = np.array(self.pts['a'][:n]), np.array(self.pts['b'][:n])
-        size_a = (self.first[0].shape[1], self.first[0].shape[0])
-        size_b = (self.first[1].shape[1], self.first[1].shape[0])
-        fa, fb, R, t, X, err = cc.calibrate_from_points(pa, pb, size_a, size_b, max(size_a) * self.s_focal.value() / 36,
-                                                        max(size_b) * self.s_focal.value() / 36)
-        out = os.path.join(sa.session_dir(self.state), 'cameras.json')
-        cc.save_cameras(out, dict(K=cc.K_matrix(fa, size_a), dist=np.zeros(5), size=size_a),
-                        dict(K=cc.K_matrix(fb, size_b), dist=np.zeros(5), size=size_b), R, t,
-                        'relative (distance between the cameras = 1)', 'clicks',
-                        dict(points=n, reprojection_px_median=round(float(np.median(err)), 2),
-                             clicks_a=pa.round(1).tolist(), clicks_b=pb.round(1).tolist()))
-        bad = ', '.join(f'{i + 1} ({e:.0f} px)' for i, e in enumerate(err) if e > 15)
-        QtWidgets.QMessageBox.information(
-            self, 'Calibration', f'Median error {np.median(err):.1f} px.' +
-            (f'\nPoints that fit badly: {bad} - undo and click them again.' if bad else '\nAll points fit well.'))
-        self.saved_path = out
-        self.accept()
+        d = p['design']
+        self.l_head.setText(
+            f'<span style="font-size:16pt"><b>{pid}</b></span>&nbsp;&nbsp; tested arm <b>{d["tested_side"]}</b>'
+            + (' + contralateral' if d['contralateral'] else '')
+            + f', practice <b>{d["practice_limb"]} {d["practice_side"]}</b>'
+            + (', familiarization with the tested arm' if d.get('familiarization') == 'test' else ''))
+        for dv in self.days.values():
+            dv.set_participant(pid)
+            dv.set_busy(self.running() and self.runner.current == (pid, dv.day))
+        if not pl.day_exists(pid, 'd1') or not pl.load_day(pid, 'd1').get('cam_a'):
+            self.day_tabs.setCurrentIndex(0)
+
+    def new_participant(self):
+        dlg = ParticipantDialog(self)
+        if not dlg.exec():
+            return
+        try:
+            p = pl.new_participant(dlg.e_id.text(), dlg.design(), dlg.settings(), dlg.s_square.value())
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, 'New participant', str(e))
+            return
+        todo = []
+        for day, (_, paths) in dlg.videos.items():
+            if paths:
+                pl.set_videos(p['id'], day, paths[0], paths[1] if len(paths) > 1 else '')
+                todo.append((p['id'], day))
+            else:
+                pl.save_day(pl.new_day_state(p, day))
+        self.refresh_list()
+        for i in range(self.list.count()):
+            if self.list.item(i).data(Qt.UserRole) == p['id']:
+                self.list.setCurrentRow(i)
+        if todo and dlg.k_start.isChecked():
+            self.start(todo)
+
+    def edit_design(self):
+        pid = self.pid()
+        if not pid:
+            return
+        if self.running() and self.runner.current and self.runner.current[0] == pid:
+            QtWidgets.QMessageBox.information(self, 'Design', 'Wait until this participant\'s run ends (or Stop it).')
+            return
+        p = pl.load_participant(pid)
+        dlg = ParticipantDialog(self, p)
+        if dlg.exec():
+            pl.update_participant(p, dlg.design(), dlg.settings(), dlg.s_square.value())
+            self.on_select()
+            self.refresh_list()
+
+    # ---------- running ----------
+    def running(self):
+        return self.runner is not None and self.runner.isRunning()
+
+    def run_day(self, pid, day):
+        if self.running():
+            # The runner's queue is the list it goes through: a day added at its end runs after the others
+            items, cur = self.runner.items, self.runner.current
+            later = items[items.index(cur) + 1:] if cur in items else items
+            if (pid, day) not in later and (pid, day) != cur:
+                items.append((pid, day))
+            return
+        self.start([(pid, day)])
+
+    def run_all(self):
+        items = pl.queue_items()
+        if not items:
+            QtWidgets.QMessageBox.information(self, 'Run all', 'Nothing to run: every day with videos is done, or '
+                                              'waits for an edit (✗).')
+            return
+        self.start(items)
+
+    def start(self, items):
+        self.runner = Runner(items)
+        self.runner.progress.connect(self.on_progress)
+        self.runner.changed.connect(self.on_changed)
+        self.runner.finished_all.connect(self.on_finished)
+        self.b_run_all.setEnabled(False)
+        self.b_stop.setEnabled(True)
+        self.l_queue.setText(f'Running {len(items)} day(s)…')
+        for dv in self.days.values():
+            dv.b_run.setEnabled(False)
+        self.runner.start()
+
+    def stop(self):
+        if self.running():
+            self.runner.stop_requested = True
+            self.l_queue.setText('Stopping after the current step part…')
+
+    def on_progress(self, i, pid, day, step, f, text):
+        n = len(self.runner.items) if self.runner else 1
+        self.l_queue.setText(f'[{i + 1}/{n}]  {pid}  {pl.DAY_NAMES[day]}\n{pl.STEP_NAMES[step]} {f:.0%}  {text}')
+        self.bar.setValue(int(f * 1000))
+        self.bar.setFormat(f'{pl.STEP_NAMES[step]} {f:.0%}')
+        if pid == self.pid():
+            self.days[day].progress(step, f, text)
+
+    def on_changed(self, pid, day):
+        self.refresh_list()
+        if pid == self.pid():
+            dv = self.days[day]
+            dv.reload()
+            dv.set_busy(self.running() and self.runner.current == (pid, day))
+
+    def on_finished(self, out):
+        self.b_run_all.setEnabled(True)
+        self.b_stop.setEnabled(False)
+        self.bar.setValue(0)
+        self.bar.setFormat('')
+        marks = ', '.join(f'{p} {"D1" if d == "d1" else "D2"} {SUMMARY_MARK.get(s, "✗")}' for p, d, s in out)
+        self.l_queue.setText(f'Finished: {marks}' if out else 'Stopped.')
+        self.runner.wait()
+        self.runner = None
+        self.refresh_list()
+        if self.pid():
+            for dv in self.days.values():
+                dv.set_busy(False)
+                dv.reload()
+
+    def export_all(self):
+        try:
+            path, n = sa.export_all()
+        except PermissionError:
+            QtWidgets.QMessageBox.warning(self, 'Export', 'The all-participants Excel is open in another program - '
+                                          'close it and try again.')
+            return
+        QtWidgets.QMessageBox.information(self, 'Export', f'Saved ({n} participants):\n{path}')
+
+    def closeEvent(self, e):
+        if self.running():
+            if QtWidgets.QMessageBox.question(self, 'Quit', 'A run is going on. Stop it and quit? (What is finished '
+                                              'is kept; the current step starts over next time.)') \
+                    != QtWidgets.QMessageBox.Yes:
+                e.ignore()
+                return
+            self.runner.stop_requested = True
+            self.runner.wait(30000)
+        e.accept()
 
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName('Reaching Lab')
-    win = LabApp()
-    win.show()
+    w = LabApp()
+    w.show()
     sys.exit(app.exec())
 
 

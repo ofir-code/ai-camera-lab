@@ -15,33 +15,127 @@ Cache: <output folder>/<video name>_session.npz (re-used if the video and the sw
 import json
 import multiprocessing as mproc
 import os
-import sys
+import queue
+import threading
 import time
 
 import cv2
 import numpy as np
 
+import extract_kinematics as ek
 import video_source as vs
 
 MP_MAX_SIDE = 1280        # frames are shrunk to this before MediaPipe (its models work on ~256 px crops)
 MOTION_EVERY = 10         # camera movement is measured every 10th frame (it changes slowly)
-TOUCH_POINTS = {          # pose points that can touch a switch (both sides)
-    'upper': [15, 16, 17, 18, 19, 20, 21, 22],   # wrists, pinky, index, thumb
-    'lower': [27, 28, 29, 30, 31, 32],           # ankles, heels, toes
-}
+# Pose points that can touch a switch, both sides: wrists, pinky, index, thumb / ankles, heels, toes
+TOUCH_POINTS = {limb: sorted(i for side in ('left', 'right') for i in ek.LIMBS[limb]['touch_points'][side])
+                for limb in ('upper', 'lower')}
 
 
-def open_video(path):
-    """The video (all its GoPro chapters) with the hardware decoder on macOS - sequential reading; jumping is
-    approximate there (see video_source.py)."""
-    return vs.VideoSource(path, hardware=True)
+def open_video(path, threads=0):
+    """The video (all its GoPro chapters) with the hardware decoder if it is on (video_source.hardware_decoding)
+    - sequential reading; jumping is approximate with AVFoundation (see video_source.py)."""
+    return vs.VideoSource(path, hardware=True, threads=threads)
 
 
 def default_workers():
-    return max(1, min(4, (os.cpu_count() or 2) // 2))
+    """Worker processes: one per 2 logical CPUs (each runs MediaPipe and, beside it, the decoding of its part).
+    LAB_WORKERS=<n> sets another number (e.g. fewer on a computer with little memory: ~0.5 GB per worker at 4K)."""
+    env = os.environ.get('LAB_WORKERS', '').strip()
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    return max(1, (os.cpu_count() or 2) // 2)
+
+
+def decoder_threads(workers):
+    """FFmpeg threads per worker: the CPUs shared out (OpenCV's default, one per CPU in every worker, makes the
+    workers' decoders fight over the CPUs)."""
+    return max(1, (os.cpu_count() or 2) // workers)
+
+
+class _Prefetch:
+    """Reads the frames of [t_start, t_end) in a thread beside MediaPipe (OpenCV releases Python's lock while
+    decoding and resizing, so both run at the same time). Yields (time ms, full frame, RGB copy for MediaPipe)."""
+    QUEUE = 3
+
+    def __init__(self, cap, t_start, t_end, scale):
+        """Start the reading thread right away.
+
+        Inputs: cap - the open video; t_start, t_end - the part of the video to read (ms); scale - how much to
+        shrink the copy given to MediaPipe (e.g. 0.5 = half size; 1 = full size).
+        """
+        self.cap, self.t_start, self.t_end, self.scale = cap, t_start, t_end, scale
+        self.q = queue.Queue(self.QUEUE)
+        self.stop = threading.Event()
+        self.error = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _put(self, item):
+        """Hand one item to the reading side, waiting while the queue is full. Gives up if close() was called.
+
+        Input: item - a frame tuple, or None for "no more frames". Returns: True if handed over, False if stopped.
+        """
+        while not self.stop.is_set():
+            try:
+                self.q.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def _run(self):
+        """The reading thread: read frames from t_start to t_end and queue them (time, frame, RGB copy).
+        An error is kept in self.error and raised later on the reading side. Returns: nothing.
+        """
+        try:
+            cap, t_start, t_end = self.cap, self.t_start, self.t_end
+            skip = 3 if t_start > 1000 else 0      # timestamps right after a jump are not reliable
+            while not self.stop.is_set():
+                if not cap.grab():
+                    break
+                t = cap.get(cv2.CAP_PROP_POS_MSEC)
+                if skip > 0:
+                    skip -= 1
+                    continue
+                if t < t_start:
+                    continue                       # before this part: no need to convert the frame
+                if t >= t_end:
+                    break
+                ok, frame = cap.retrieve()
+                if not ok:
+                    break
+                small = (cv2.resize(frame, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
+                         if self.scale < 1 else frame)
+                if not self._put((t, frame, cv2.cvtColor(small, cv2.COLOR_BGR2RGB))):
+                    return
+        except Exception as e:   # handed to the reading side
+            self.error = e
+        self._put(None)
+
+    def __iter__(self):
+        """Loop over the frames: `for t_ms, frame, rgb in prefetch:`. Ends when the part is done; if reading
+        failed, raises that error here.
+        """
+        while True:
+            item = self.q.get()
+            if item is None:
+                if self.error is not None:
+                    raise self.error
+                return
+            yield item
+
+    def close(self):
+        """Stop the reading thread and wait for it to finish (call this when done or cancelled)."""
+        self.stop.set()
+        self.thread.join()
 
 
 def cache_path(video_path, out_dir):
+    """The file name of a video's cache (its per-frame data): <out_dir>/<video name>_session.npz.
+
+    Inputs: video_path - the video; out_dir - the session folder. Returns: the cache file's path.
+    """
     return os.path.join(out_dir, os.path.splitext(os.path.basename(video_path))[0] + '_session.npz')
 
 
@@ -58,77 +152,72 @@ def load_cache(video_path, out_dir, boxes=None):
         return None
     if not meta.get('complete'):   # older caches used a too strict test: check against the video's length
         src = vs.VideoSource(video_path, hardware=False)
-        meta['complete'] = meta['frames'] >= src.total_frames - max(2, meta['fps']) * len(src.paths)
+        meta['complete'] = _complete(meta['frames'], src, meta['fps'])
     d['meta'] = meta
     return d
 
 
-def _process_range(job):
-    """Worker: frames [start, end) of the video -> per-frame arrays (saved to a temporary .npz)."""
-    import extract_kinematics as ek
+def _complete(frames, src, fps):
+    """All frames there? (a chapter's frame count can be a little off: up to 1 s per chapter is allowed)"""
+    return frames >= src.total_frames - max(2, fps) * len(src.paths)
+
+
+def _process_range(job, stop=None):
+    """Worker: frames [start, end) of the video -> per-frame arrays (saved to a temporary .npz). stop: a
+    threading.Event that ends it early (the one-worker case runs in a thread; processes are terminated)."""
     import mediapipe as mp
-    video_path, boxes, t_start, t_end, out_file, counter = job   # this part: frames with t_start <= ms < t_end
-    cap = open_video(video_path)
+    video_path, boxes, t_start, t_end, out_file, counter = job[:6]   # this part: frames with t_start <= ms < t_end
+    threads = job[6] if len(job) > 6 else 0
+    cap = open_video(video_path, threads)
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     ok, first = cap.read()
     camera = ek.CameraMotion(first)
     cap.release()
-    cap = open_video(video_path)
+    cap = open_video(video_path, threads)
     if t_start > 1000:
         cap.set(cv2.CAP_PROP_POS_MSEC, t_start - 1000)
-    skip = 3                                   # timestamps right after a jump are not reliable
     scale = min(1.0, MP_MAX_SIDE / max(w, h))
     n_sw = len(boxes)
-    light_corners = [ek.box_corners(b, w, h, ek.LIGHT_BOX_MARGIN) for b in boxes]
-    touch_corners = [ek.box_corners(b, w, h, 0.0) for b in boxes]
-    sizes = np.array([np.sqrt((b[2] - b[0]) * w * (b[3] - b[1]) * h) for b in boxes])
+    light_corners, touch_corners, sizes = ek.switch_geometry(boxes, w, h)
     times, pose, motion, light, tu, tl = [], [], [], [], [], []
-    with mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5,
-                                model_complexity=1) as model:
-        i = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            t = cap.get(cv2.CAP_PROP_POS_MSEC)
-            if t_start > 1000 and skip > 0:
-                skip -= 1
-                continue
-            if t < t_start:
-                continue
-            if t >= t_end:
-                break
-            times.append(t)
-            if i % MOTION_EVERY == 0:
-                camera.update(frame)
-            motion.append(camera.M.copy())
-            small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else frame
-            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable = False
-            r = model.process(rgb)
-            p = (np.array([[lm.x * w, lm.y * h, lm.visibility] for lm in r.pose_landmarks.landmark])
-                 if r.pose_landmarks else np.full((33, 3), np.nan))
-            pose.append(p)
-            lv, du, dl = np.zeros(n_sw), np.full(n_sw, np.inf), np.full(n_sw, np.inf)
-            pts = {k: [q for q in p[v, :2] if not np.isnan(q[0])] for k, v in TOUCH_POINTS.items()}
-            for s in range(n_sw):
-                lv[s] = ek.light_energy(frame, camera.apply(light_corners[s]))
-                poly = camera.apply(touch_corners[s]).astype(np.float32)
-                for key, out in (('upper', du), ('lower', dl)):
-                    if pts[key]:
-                        out[s] = min(-cv2.pointPolygonTest(poly, (float(x), float(y)), True)
-                                     for x, y in pts[key]) / sizes[s]
-            light.append(lv)
-            tu.append(du)
-            tl.append(dl)
-            i += 1
-            if counter is not None and i % 15 == 0:
-                with counter.get_lock():
-                    counter.value += 15
-    cap.release()
+    frames = _Prefetch(cap, t_start, t_end, scale)
+    try:
+        with mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5,
+                                    model_complexity=1) as model:
+            i = 0
+            for t, frame, rgb in frames:
+                if stop is not None and stop.is_set():
+                    break
+                times.append(t)
+                if i % MOTION_EVERY == 0:
+                    camera.update(frame)
+                motion.append(camera.M.copy())
+                rgb.flags.writeable = False
+                r = model.process(rgb)
+                p = (np.array([[lm.x * w, lm.y * h, lm.visibility] for lm in r.pose_landmarks.landmark])
+                     if r.pose_landmarks else np.full((33, 3), np.nan))
+                pose.append(p)
+                lv, du, dl = np.zeros(n_sw), np.full(n_sw, np.inf), np.full(n_sw, np.inf)
+                pts = {k: [q for q in p[v, :2] if not np.isnan(q[0])] for k, v in TOUCH_POINTS.items()}
+                for s in range(n_sw):
+                    lv[s] = ek.light_energy(frame, camera.apply(light_corners[s]))
+                    poly = camera.apply(touch_corners[s]).astype(np.float32)
+                    du[s] = ek.touch_distance(poly, pts['upper'], sizes[s])
+                    dl[s] = ek.touch_distance(poly, pts['lower'], sizes[s])
+                light.append(lv)
+                tu.append(du)
+                tl.append(dl)
+                i += 1
+                if counter is not None and i % 15 == 0:
+                    with counter.get_lock():
+                        counter.value += 15
+    finally:
+        frames.close()
+        cap.release()
     np.savez(out_file, times=np.array(times), pose=np.array(pose, np.float32).reshape(-1, 33, 3),
              motion=np.array(motion, np.float32).reshape(-1, 2, 3), light=np.array(light, np.float32).reshape(-1, n_sw),
-             touch_upper=np.array(tu, np.float32).reshape(-1, n_sw), touch_lower=np.array(tl, np.float32).reshape(-1, n_sw))
+             touch_upper=np.array(tu, np.float32).reshape(-1, n_sw), touch_lower=np.array(tl, np.float32).reshape(-1, n_sw),
+             decoder=np.array(cap.decoder))
     return out_file
 
 
@@ -148,17 +237,25 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
     ctx = mproc.get_context('spawn')
     counter = ctx.Value('i', 0)
     parts = [os.path.join(out_dir, f'.{stem}_part{k}.npz') for k in range(workers)]
-    jobs = [(video_path, boxes, edges[k], edges[k + 1], parts[k], counter) for k in range(workers)]
+    threads = decoder_threads(workers)
+    jobs = [(video_path, boxes, edges[k], edges[k + 1], parts[k], counter, threads) for k in range(workers)]
     t0 = time.time()
     if workers == 1:
-        import threading
-        th = threading.Thread(target=_process_range, args=(jobs[0],))
+        stop_thread, errors = threading.Event(), []
+
+        def run():
+            """With one worker the work runs in a thread (not a separate process); an error is saved for the caller."""
+            try:
+                _process_range(jobs[0], stop_thread)
+            except Exception as e:   # raised below, in the caller's thread
+                errors.append(e)
+        th = threading.Thread(target=run, daemon=True)
         th.start()
         alive = th.is_alive
         pool = None
     else:
         pool = ctx.Pool(workers, initializer=_init_worker, initargs=(counter,))
-        res = pool.map_async(_range_with_counter, [j[:-1] + (None,) for j in jobs])
+        res = pool.map_async(_range_with_counter, [j[:5] + (None,) + j[6:] for j in jobs])
         alive = lambda: not res.ready()
     stopped = False
     while alive():
@@ -171,6 +268,8 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
             stopped = True
             if pool is not None:
                 pool.terminate()
+            else:
+                stop_thread.set()
             break
     if pool is not None:
         if not stopped:
@@ -179,6 +278,8 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
         pool.join()
     else:
         th.join()
+        if errors and not stopped:
+            raise errors[0]
     if stopped:
         for p in parts:
             if os.path.exists(p):
@@ -187,15 +288,36 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
     chunks = [dict(np.load(p)) for p in parts]
     for p in parts:
         os.remove(p)
-    d = {k: np.concatenate([c[k] for c in chunks]) for k in chunks[0]}
+    decoders = sorted({str(c.pop('decoder')) for c in chunks})
+    d, seams = join_parts(chunks, fps)
     d['light'], d['touch_upper'], d['touch_lower'] = d['light'].T, d['touch_upper'].T, d['touch_lower'].T
     meta = dict(video=os.path.abspath(video_path), video_size=vs.total_size(video_path), fps=fps, size=size,
                 chapters=[os.path.basename(p) for p in src.paths],
-                boxes=boxes, frames=len(d['times']), complete=len(d['times']) >= total - max(2, fps) * len(src.paths),
-                seconds=round(time.time() - t0, 1), workers=workers)
+                boxes=boxes, frames=len(d['times']), complete=_complete(len(d['times']), src, fps),
+                seconds=round(time.time() - t0, 1), workers=workers, decoder='+'.join(decoders), seams=seams)
     np.savez_compressed(cache_path(video_path, out_dir), meta=json.dumps(meta), **d)
     d['meta'] = meta
     return d
+
+
+def join_parts(chunks, fps):
+    """The workers' parts -> one per-frame dict, checked where they meet: a frame the next part read again
+    (a jump by time that landed too early and a timestamp off) is dropped; a gap (> 1.5 frames) is reported.
+    Returns (data, seams): seams = [dict(ms, repeated, missing frames)] for the seams that were not clean."""
+    seams = []
+    for k in range(1, len(chunks)):
+        prev = next((c['times'] for c in reversed(chunks[:k]) if len(c['times'])), None)
+        cur = chunks[k]
+        if prev is None or not len(cur['times']):
+            continue
+        last = prev[-1]
+        repeated = int(np.sum(cur['times'] <= last + 0.25 * 1000 / fps))
+        if repeated:
+            chunks[k] = cur = {key: v[repeated:] for key, v in cur.items()}
+        gap = (cur['times'][0] - last) * fps / 1000 - 1 if len(cur['times']) else 0
+        if repeated or gap > 0.5:
+            seams.append(dict(ms=round(float(last), 1), repeated=repeated, missing=int(round(max(0, gap)))))
+    return {key: np.concatenate([c[key] for c in chunks]) for key in chunks[0]}, seams
 
 
 _counter = None
@@ -208,4 +330,8 @@ def _init_worker(counter):
 
 
 def _range_with_counter(job):
-    return _process_range(job[:-1] + (_counter,))
+    """Run one worker's part of the video (in a separate process), with the shared frame counter put back in.
+
+    Input: job - the worker's job tuple (see process_video). Returns: what _process_range returns.
+    """
+    return _process_range(job[:5] + (_counter,) + job[6:])
