@@ -25,6 +25,7 @@ import numpy as np
 import extract_kinematics as ek
 import video_source as vs
 
+POSE_MODELS = {'full': 1, 'heavy': 2}   # MediaPipe Pose model_complexity: heavy is ~3x slower, steadier
 MP_MAX_SIDE = 1280        # frames are shrunk to this before MediaPipe (its models work on ~256 px crops)
 MOTION_EVERY = 10         # camera movement is measured every 10th frame (it changes slowly)
 # Pose points that can touch a switch, both sides: wrists, pinky, index, thumb / ankles, heels, toes
@@ -139,8 +140,9 @@ def cache_path(video_path, out_dir):
     return os.path.join(out_dir, os.path.splitext(os.path.basename(video_path))[0] + '_session.npz')
 
 
-def load_cache(video_path, out_dir, boxes=None):
-    """The cached per-frame data, or None if missing/outdated (other video file or other switch boxes)."""
+def load_cache(video_path, out_dir, boxes=None, model=None):
+    """The cached per-frame data, or None if missing/outdated (other video file, other switch boxes, or - when
+    `model` is given - made with another pose model)."""
     path = cache_path(video_path, out_dir)
     if not os.path.exists(path) or not os.path.exists(video_path):
         return None
@@ -149,6 +151,8 @@ def load_cache(video_path, out_dir, boxes=None):
     if meta.get('video_size') != vs.total_size(video_path):
         return None
     if boxes is not None and (np.shape(meta['boxes']) != np.shape(boxes) or not np.allclose(meta['boxes'], boxes)):
+        return None
+    if model is not None and meta.get('pose_model', 'full') != model:
         return None
     if not meta.get('complete'):   # older caches used a too strict test: check against the video's length
         src = vs.VideoSource(video_path, hardware=False)
@@ -168,6 +172,7 @@ def _process_range(job, stop=None):
     import mediapipe as mp
     video_path, boxes, t_start, t_end, out_file, counter = job[:6]   # this part: frames with t_start <= ms < t_end
     threads = job[6] if len(job) > 6 else 0
+    complexity = POSE_MODELS[job[7] if len(job) > 7 else 'full']
     cap = open_video(video_path, threads)
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     ok, first = cap.read()
@@ -183,7 +188,7 @@ def _process_range(job, stop=None):
     frames = _Prefetch(cap, t_start, t_end, scale)
     try:
         with mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5,
-                                    model_complexity=1) as model:
+                                    model_complexity=complexity) as model:
             i = 0
             for t, frame, rgb in frames:
                 if stop is not None and stop.is_set():
@@ -221,9 +226,12 @@ def _process_range(job, stop=None):
     return out_file
 
 
-def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, workers=None):
+def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, workers=None, model='full'):
     """Run the pass (in parallel parts) and save the cache. `progress(done_frames, total, seconds_left)` is
-    called now and then; `should_stop()` -> True stops it (nothing is saved). Returns the cache dict."""
+    called now and then; `should_stop()` -> True stops it (nothing is saved). model: 'full' or 'heavy'
+    (POSE_MODELS). Returns the cache dict."""
+    if model not in POSE_MODELS:
+        raise ValueError(f'Unknown pose model {model!r} - use one of {list(POSE_MODELS)}')
     src = vs.VideoSource(video_path, hardware=False)    # all chapters of a GoPro clip
     total = src.total_frames
     fps = src.get(cv2.CAP_PROP_FPS) or 30.0
@@ -238,7 +246,7 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
     counter = ctx.Value('i', 0)
     parts = [os.path.join(out_dir, f'.{stem}_part{k}.npz') for k in range(workers)]
     threads = decoder_threads(workers)
-    jobs = [(video_path, boxes, edges[k], edges[k + 1], parts[k], counter, threads) for k in range(workers)]
+    jobs = [(video_path, boxes, edges[k], edges[k + 1], parts[k], counter, threads, model) for k in range(workers)]
     t0 = time.time()
     if workers == 1:
         stop_thread, errors = threading.Event(), []
@@ -294,7 +302,8 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
     meta = dict(video=os.path.abspath(video_path), video_size=vs.total_size(video_path), fps=fps, size=size,
                 chapters=[os.path.basename(p) for p in src.paths],
                 boxes=boxes, frames=len(d['times']), complete=_complete(len(d['times']), src, fps),
-                seconds=round(time.time() - t0, 1), workers=workers, decoder='+'.join(decoders), seams=seams)
+                seconds=round(time.time() - t0, 1), workers=workers, decoder='+'.join(decoders), seams=seams,
+                pose_model=model)
     np.savez_compressed(cache_path(video_path, out_dir), meta=json.dumps(meta), **d)
     d['meta'] = meta
     return d

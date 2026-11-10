@@ -48,6 +48,7 @@ SWITCH_WINDOWS = ((0.0, 5.0), (5.0, 5.0))           # (from minute, for minutes)
 
 DESIGN_DEFAULT = dict(tested_side='right', contralateral=False, practice_limb='upper', practice_side='right',
                       familiarization='practice')     # familiarization with the practice limb, or 'test': tested arm
+POSE_MODEL_DEFAULT = 'full'      # MediaPipe Pose model: 'full' or 'heavy' (~3x slower, steadier - see session_engine)
 
 
 class Stopped(Exception):
@@ -70,7 +71,7 @@ def check_id(pid):
     return pid
 
 
-def new_participant(pid, design=None, settings=None, square_mm=None, results_dir=None):
+def new_participant(pid, design=None, settings=None, square_mm=None, results_dir=None, pose_model=None):
     """Create a participant (results/<id>/participant.json). Raises ValueError if the id is taken or not valid.
 
     Inputs: pid - the id (e.g. 'S01'); design - dict like DESIGN_DEFAULT; settings - experiment_design.Settings
@@ -82,7 +83,8 @@ def new_participant(pid, design=None, settings=None, square_mm=None, results_dir
     if os.path.exists(os.path.join(participant_dir(pid, results_dir), 'participant.json')):
         raise ValueError(f'Participant {pid} already exists.')
     p = dict(id=pid, design=dict(DESIGN_DEFAULT, **(design or {})),
-             settings=settings or asdict(ed.Settings()), square_mm=square_mm or cc.BOARD_SQUARE_MM, created=_now())
+             settings=settings or asdict(ed.Settings()), square_mm=square_mm or cc.BOARD_SQUARE_MM,
+             pose_model=pose_model or POSE_MODEL_DEFAULT, created=_now())
     save_participant(p, results_dir)
     return p
 
@@ -106,6 +108,7 @@ def load_participant(pid, results_dir=None):
         p['design'] = dict(DESIGN_DEFAULT, **p.get('design', {}))
         p.setdefault('settings', asdict(ed.Settings()))
         p.setdefault('square_mm', 38.0)
+        p.setdefault('pose_model', 'full')
         p['id'] = pid
         return p
     for day in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
@@ -133,7 +136,7 @@ def list_participants(results_dir=None):
     return out
 
 
-def update_participant(p, design=None, settings=None, square_mm=None, results_dir=None):
+def update_participant(p, design=None, settings=None, square_mm=None, results_dir=None, pose_model=None):
     """Change a participant's design / settings / board size; the days' steps that use them become to-do.
 
     Returns: the updated participant dict."""
@@ -147,6 +150,9 @@ def update_participant(p, design=None, settings=None, square_mm=None, results_di
     if square_mm is not None and abs(float(square_mm) - p['square_mm']) > 1e-9:
         p['square_mm'] = float(square_mm)
         changed.add('calibration')
+    if pose_model is not None and pose_model != p.get('pose_model', 'full'):
+        p['pose_model'] = pose_model
+        changed.add('processing')
     save_participant(p, results_dir)
     for day in DAYS:
         if day_exists(p['id'], day, results_dir):
@@ -191,6 +197,7 @@ def _apply_participant(st, p):
     st['design'] = dict(p['design'], retest=st['session'] != 'd1')
     st['settings'] = dict(p['settings'])
     st['square_mm'] = p['square_mm']
+    st['pose_model'] = p.get('pose_model', 'full')
 
 
 def load_day(pid, day, results_dir=None):
@@ -565,10 +572,11 @@ def step_processing(st, progress, should_stop, results_dir=None):
         path, boxes = st[f'cam_{c}'], st.get(f'boxes_{c}')
         if not boxes:
             raise ValueError(f'Camera {c.upper()} has no switches marked.')
-        cache = se.load_cache(path, out, boxes)
+        model = st.get('pose_model', 'full')
+        cache = se.load_cache(path, out, boxes, model)
         if cache is None or not cache['meta'].get('complete'):
             t0 = time.time()
-            cache = se.process_video(path, boxes, out, should_stop=should_stop,
+            cache = se.process_video(path, boxes, out, should_stop=should_stop, model=model,
                                      progress=lambda n, tot, left, i=i: progress(
                                          (i + n / max(tot, 1)) / len(cams),
                                          f'camera {c.upper()}' + (f', {left / 60:.0f} min left' if left else '')))
@@ -582,7 +590,7 @@ def step_processing(st, progress, should_stop, results_dir=None):
             details.append(f'! Camera {c.upper()}: frames missing where the parallel parts meet ({len(gaps)} places) '
                            '- run with LAB_WORKERS=1 to avoid it.')
             status = STATUS_WARN
-    return status, 'Every frame processed.', details
+    return status, f'Every frame processed ({st.get("pose_model", "full")} pose model).', details
 
 
 def step_analysis(st, progress, should_stop, results_dir=None):

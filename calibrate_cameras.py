@@ -323,6 +323,10 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
             break
     for s in srcs:
         s.release()
+    # Views whose corners lie (nearly) on one line - an edge-on board, or one row of corners - can't tell a
+    # lens (OpenCV fails on them): leave them out
+    for v in range(2):
+        seen[v] = {k: d for k, d in seen[v].items() if _spread_view(board_xyz[d[1]])}
     for v in range(2):
         if len(seen[v]) < 10:
             raise ValueError(f'The board was found in only {len(seen[v])} frames of video {"AB"[v]} - need 10+ '
@@ -395,6 +399,14 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
     res['ok'] = not warnings
     res['method'] = 'board (moving)'
     return res
+
+
+def _spread_view(xyz, min_ratio=0.15):
+    """True if the board corners seen are spread over an area, not (nearly) along one line."""
+    if len(xyz) < 6:
+        return False
+    sv = np.linalg.svd(xyz[:, :2] - xyz[:, :2].mean(axis=0), compute_uv=False)
+    return sv[0] > 0 and sv[1] / sv[0] > min_ratio
 
 
 def _board_movement(seen):

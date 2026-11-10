@@ -126,7 +126,8 @@ class Session:
         self.cams = {}
         for c in ('a', 'b'):
             if state.get(f'cam_{c}') and state.get(f'boxes_{c}'):
-                cache = se.load_cache(state[f'cam_{c}'], self.folder, state[f'boxes_{c}'])
+                cache = se.load_cache(state[f'cam_{c}'], self.folder, state[f'boxes_{c}'],
+                                      state.get('pose_model', 'full'))
                 if cache is not None:
                     self.cams[c] = cache
         self.A, self.B = self.cams.get('a'), self.cams.get('b')

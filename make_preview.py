@@ -2,8 +2,10 @@
 MediaPipe skeleton, the switch boxes (target in yellow), the tracked wrist / ankle (red cross) and the trial's
 part / block / sequence / trial / target / outcome / RT / MT. A bar at the bottom shows the blocks of the session.
 
-    venv/bin/python make_preview.py <participant> [day] [trials per block]
+    venv/bin/python make_preview.py <participant> [day] [trials per block] [heavy]
     -> results/<participant>/<day>/<participant>_<day>_preview.mp4
+With "heavy", the skeleton is MediaPipe Pose's heavy model (model_complexity=2), run on the shown frames
+(the trial info and RT / MT still come from the day's analysis) -> ..._preview_heavy.mp4
 """
 import os
 import sys
@@ -52,11 +54,12 @@ class Reader:
         return self.frame
 
 
-def draw_camera(frame, cache, cf, boxes, r, cam_name):
-    """Skeleton, switch boxes (target yellow), the tracked marker, the camera name."""
+def draw_camera(frame, cache, cf, boxes, r, cam_name, pose=None):
+    """Skeleton, switch boxes (target yellow), the tracked marker, the camera name. pose: another skeleton than
+    the cached one (33 x 3: x, y px, visibility)."""
     h, w = frame.shape[:2]
     sc = w / 1920
-    pose = cache['pose'][cf]
+    pose = cache['pose'][cf] if pose is None else pose
     vis = pose[:, 2] if pose.shape[1] > 2 else np.ones(len(pose))
     for a, b in POSE_LINES:
         if not (np.isnan(pose[a, 0]) or np.isnan(pose[b, 0])) and min(vis[a], vis[b]) > 0.3:
@@ -91,7 +94,24 @@ def text_lines(img, lines, x, y, size, color=(255, 255, 255), gap=1.45):
                     cv2.LINE_AA)
 
 
-def make_preview(pid, day='d1', per_block=2, out=None, progress=print):
+class LivePose:
+    """MediaPipe Pose run on the frames as they are shown (one tracker per camera), shrunk like the app does."""
+
+    def __init__(self, complexity):
+        import mediapipe as mp
+        self.model = mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5,
+                                            model_complexity=complexity)
+
+    def __call__(self, frame):
+        h, w = frame.shape[:2]
+        sc = min(1.0, 1280 / max(w, h))
+        small = cv2.resize(frame, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA) if sc < 1 else frame
+        r = self.model.process(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+        return (np.array([[lm.x * w, lm.y * h, lm.visibility] for lm in r.pose_landmarks.landmark])
+                if r.pose_landmarks else np.full((33, 3), np.nan))
+
+
+def make_preview(pid, day='d1', per_block=2, out=None, progress=print, complexity=None):
     st = pl.load_day(pid, day)
     s = sa.Session(st)
     res = s.analyze()
@@ -119,7 +139,9 @@ def make_preview(pid, day='d1', per_block=2, out=None, progress=print):
     vid_h = max(int(half * size[c][1] / size[c][0]) for c in cams)
     info_h, bar_h = 150, 60
     H = vid_h + info_h + bar_h
-    out = out or os.path.join(pl.day_dir(pid, day), f'{pid}_{day}_preview.mp4')
+    live = {c: LivePose(complexity) for c in cams} if complexity is not None else None
+    tag = {2: '_heavy', 0: '_lite'}.get(complexity, '')
+    out = out or os.path.join(pl.day_dir(pid, day), f'{pid}_{day}_preview{tag}.mp4')
     writer = None
     for codec in ('avc1', 'mp4v'):
         writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*codec), OUT_FPS, (OUT_W, H))
@@ -142,7 +164,9 @@ def make_preview(pid, day='d1', per_block=2, out=None, progress=print):
                 frame = readers[c].get(cf)
                 if frame is None:
                     continue
-                frame = draw_camera(frame.copy(), s.cams[c], cf, st[f'boxes_{c}'], r, f'camera {c.upper()}')
+                pose = live[c](frame) if live else None
+                name = f'camera {c.upper()}' + ('  (heavy model)' if complexity == 2 else '')
+                frame = draw_camera(frame.copy(), s.cams[c], cf, st[f'boxes_{c}'], r, name, pose)
                 sw, sh = size[c]
                 small = cv2.resize(frame, (half, int(half * sh / sw)), interpolation=cv2.INTER_AREA)
                 canvas[:small.shape[0], k * half:k * half + half] = small
@@ -187,5 +211,6 @@ def make_preview(pid, day='d1', per_block=2, out=None, progress=print):
 
 if __name__ == '__main__':
     args = sys.argv[1:]
-    path = make_preview(args[0], args[1] if len(args) > 1 else 'd1', int(args[2]) if len(args) > 2 else 2)
+    path = make_preview(args[0], args[1] if len(args) > 1 else 'd1', int(args[2]) if len(args) > 2 else 2,
+                        complexity=2 if 'heavy' in args[3:] else None)
     print('Saved', path)

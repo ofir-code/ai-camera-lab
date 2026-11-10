@@ -140,6 +140,10 @@ class ParticipantDialog(QtWidgets.QDialog):
         f.addRow('New block after a pause longer than', self.s_gap)
         f.addRow('Switch order in a sequence', self.e_pattern)
         f.addRow('Calibration board square (measured)', self.s_square)
+        self.c_model = QtWidgets.QComboBox()
+        self.c_model.addItems(['full (faster)', 'heavy (steadier skeleton, ~3x slower processing)'])
+        self.c_model.setCurrentIndex(1 if (participant or {}).get('pose_model', pl.POSE_MODEL_DEFAULT) == 'heavy' else 0)
+        f.addRow('MediaPipe pose model', self.c_model)
         self.adv = group('Settings (usually left as they are)', f)
         self.adv.setCheckable(True)
         self.adv.setChecked(participant is not None)
@@ -175,6 +179,9 @@ class ParticipantDialog(QtWidgets.QDialog):
             e, lst = self.videos[day]
             lst[:] = paths
             e.setText('   +   '.join(os.path.basename(p) for p in paths))
+
+    def pose_model(self):
+        return 'heavy' if self.c_model.currentIndex() == 1 else 'full'
 
     def design(self):
         return dict(tested_side=self.c_tested.currentText(), contralateral=self.k_contra.isChecked(),
@@ -941,7 +948,8 @@ class LabApp(QtWidgets.QMainWindow):
         if not dlg.exec():
             return
         try:
-            p = pl.new_participant(dlg.e_id.text(), dlg.design(), dlg.settings(), dlg.s_square.value())
+            p = pl.new_participant(dlg.e_id.text(), dlg.design(), dlg.settings(), dlg.s_square.value(),
+                                   pose_model=dlg.pose_model())
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, 'New participant', str(e))
             return
@@ -969,7 +977,8 @@ class LabApp(QtWidgets.QMainWindow):
         p = pl.load_participant(pid)
         dlg = ParticipantDialog(self, p)
         if dlg.exec():
-            pl.update_participant(p, dlg.design(), dlg.settings(), dlg.s_square.value())
+            pl.update_participant(p, dlg.design(), dlg.settings(), dlg.s_square.value(),
+                                  pose_model=dlg.pose_model())
             self.on_select()
             self.refresh_list()
 
