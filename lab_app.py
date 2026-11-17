@@ -489,7 +489,7 @@ class DayView(QtWidgets.QWidget):
         self.s_cal_len.setRange(0, 1800)
         self.s_cal_len.setSuffix(' s')
         self.s_cal_len.setSpecialValueText('automatic')
-        self.s_cal_len.setToolTip('automatic: the first 3 minutes, then 3-7 minutes')
+        self.s_cal_len.setToolTip('automatic: the first 40 s, 90 s and 3 min, then 3-7 min - the best fit is kept')
         for x in (self.r_cal_auto, QtWidgets.QLabel('from'), self.s_cal_from, QtWidgets.QLabel('for'), self.s_cal_len):
             f.addWidget(x)
         f.addStretch()

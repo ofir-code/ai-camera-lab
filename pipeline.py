@@ -44,7 +44,11 @@ STATUS_TODO, STATUS_RUNNING, STATUS_OK, STATUS_WARN, STATUS_ERROR, STATUS_SKIPPE
 DONE = (STATUS_OK, STATUS_WARN, STATUS_SKIPPED)
 
 # Where the automatic steps look (seconds into camera A's video)
-CALIB_WINDOWS = ((0.0, 180.0), (180.0, 240.0))      # the board is filmed at the start of the session
+# Where the board is looked for (start s, length s): it is filmed at the start, usually 20-40 s; a longer
+# window may add moments where it lies on the table or is half covered, which spoil the fit - so several
+# windows are tried and the one with the best check (steadiest squares) is kept
+CALIB_WINDOWS = ((0.0, 40.0), (0.0, 90.0), (0.0, 180.0), (180.0, 240.0))
+CALIB_GOOD_ENOUGH_SD_MM = 0.35    # a fit this good (squares' spread, mm) ends the search early
 CALIB_PER_SECOND = 2.0
 SWITCH_WINDOWS = ((0.0, 5.0), (5.0, 5.0))           # (from minute, for minutes): the first trials light them up
 
@@ -485,11 +489,11 @@ def step_calibration(st, progress, should_stop, results_dir=None):
         windows = [(c['start_s'], c['seconds'])]
     else:
         windows = list(CALIB_WINDOWS)
-    errors = []
+    errors, best = [], None
     for k, (start, length) in enumerate(windows):
         if should_stop():
             raise Stopped()
-        where = 'the board clips' if length is None else f'{start / 60:.0f}-{(start + length) / 60:.0f} min'
+        where = 'the board clips' if length is None else f'{start:.0f}-{start + length:.0f} s'
         try:
             res = cc.calibrate_board(va, vb, offset, st.get('square_mm', 38.0), start, length, CALIB_PER_SECOND,
                                      progress=lambda f, t='': progress((k + f) / len(windows), t),
@@ -504,10 +508,18 @@ def step_calibration(st, progress, should_stop, results_dir=None):
             errors.append(f'{where}: the fit came out wrong (reprojection {res["reprojection_px"]:.1f} px, squares '
                           f'{res["square_mean_mm"]:.1f} ± {res["square_sd_mm"]:.1f} mm) - not used.')
             continue
+        errors.append(f'{where}: squares {res["square_mean_mm"]:.2f} ± {res["square_sd_mm"]:.2f} mm, reprojection '
+                      f'{res["reprojection_px"]:.2f} px.')
+        if best is None or (res['square_sd_mm'], res['reprojection_px']) < (best[0]['square_sd_mm'], best[0]['reprojection_px']):
+            best = (res, where)
+        if res['square_sd_mm'] < CALIB_GOOD_ENOUGH_SD_MM and res['ok']:
+            break
+    if best is not None:
+        res, where = best
         path = os.path.join(day_dir(st['subject'], st['session'], results_dir), 'cameras_board.json')
         cc.save_board_calibration(path, res, va, vb)
         st['calibration'] = path
-        details = [f'Board searched in {where}.'] + cc.board_report(res).splitlines()
+        details = [f'Windows tried - {"; ".join(errors)}', f'Used: {where}.'] + cc.board_report(res).splitlines()
         if res['ok']:
             return STATUS_OK, f'3D: cameras {res["distance_cm"]:.0f} cm apart, squares {res["square_mean_mm"]:.1f} mm.', details
         return STATUS_WARN, f'3D with warnings: cameras {res["distance_cm"]:.0f} cm apart.', details
@@ -519,7 +531,7 @@ def step_calibration(st, progress, should_stop, results_dir=None):
         for start, length in windows:
             if should_stop():
                 raise Stopped()
-            where = 'the board clips' if length is None else f'{start / 60:.0f}-{(start + length) / 60:.0f} min'
+            where = 'the board clips' if length is None else f'{start:.0f}-{start + length:.0f} s'
             try:
                 res = cc.calibrate_board(va, vb, offset, st.get('square_mm', 38.0), start, length, CALIB_PER_SECOND,
                                          progress=lambda f, t='': progress(f, t), should_stop=should_stop,
