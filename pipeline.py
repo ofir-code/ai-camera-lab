@@ -500,8 +500,7 @@ def step_calibration(st, progress, should_stop, results_dir=None):
             errors.append(f'{where}: {e}')
             continue
         # A fit that came out wrong (nonsense stereo error, squares far off) is not used
-        if not (np.isfinite(res['stereo_rms_px']) and res['reprojection_px'] < 5 and
-                abs(res['square_mean_mm'] - res['square_mm']) < 1.5 and res['square_sd_mm'] < 1.5):
+        if not calibration_ok(res):
             errors.append(f'{where}: the fit came out wrong (reprojection {res["reprojection_px"]:.1f} px, squares '
                           f'{res["square_mean_mm"]:.1f} ± {res["square_sd_mm"]:.1f} mm) - not used.')
             continue
@@ -512,11 +511,77 @@ def step_calibration(st, progress, should_stop, results_dir=None):
         if res['ok']:
             return STATUS_OK, f'3D: cameras {res["distance_cm"]:.0f} cm apart, squares {res["square_mean_mm"]:.1f} mm.', details
         return STATUS_WARN, f'3D with warnings: cameras {res["distance_cm"]:.0f} cm apart.', details
+    # The board views couldn't tell the lenses (e.g. the board only laid flat on the table): each camera's lens
+    # from an earlier good calibration of the same GoPro, and only where the cameras are from this recording
+    lenses = earlier_lenses(va, vb, results_dir,
+                            os.path.join(day_dir(st['subject'], st['session'], results_dir), 'cameras_board.json'))
+    if lenses is not None:
+        for start, length in windows:
+            if should_stop():
+                raise Stopped()
+            where = 'the board clips' if length is None else f'{start / 60:.0f}-{(start + length) / 60:.0f} min'
+            try:
+                res = cc.calibrate_board(va, vb, offset, st.get('square_mm', 38.0), start, length, CALIB_PER_SECOND,
+                                         progress=lambda f, t='': progress(f, t), should_stop=should_stop,
+                                         lenses=lenses)
+            except ValueError as e:
+                errors.append(f'{where}, with earlier lenses: {e}')
+                continue
+            if not calibration_ok(res):
+                errors.append(f'{where}, with earlier lenses: the fit came out wrong - not used.')
+                continue
+            path = os.path.join(day_dir(st['subject'], st['session'], results_dir), 'cameras_board.json')
+            cc.save_board_calibration(path, res, va, vb)
+            st['calibration'] = path
+            details = errors + [f'Board searched in {where}.'] + cc.board_report(res).splitlines()
+            return (STATUS_WARN, f'3D with the lenses of an earlier calibration (the board views here could not '
+                    f'tell the lenses): cameras {res["distance_cm"]:.0f} cm apart.', details)
     st['calibration'] = ''
     if st.get('calibration_source') == 'clips':
         raise ValueError('The board was not found in the clips.\n' + '\n'.join(errors))
     return (STATUS_WARN, 'The board was not found - each camera is analysed in 2D. Set the time window where the '
             'board is filmed, or use the calibration file of an earlier recording.', errors)
+
+
+def calibration_ok(res):
+    """A board calibration whose check makes sense (squares close to the entered size, small reprojection)."""
+    try:
+        return bool(np.isfinite(res['stereo_rms_px']) and res['reprojection_px'] < 5 and
+                    abs(res['square_mean_mm'] - res['square_mm']) < 1.5 and res['square_sd_mm'] < 1.5)
+    except (KeyError, TypeError):
+        return False
+
+
+def earlier_lenses(video_a, video_b, results_dir=None, exclude=None):
+    """Each camera's lens from the latest good calibration of that same GoPro (by its serial number) in the
+    results folder - the lens doesn't change when a camera is moved (same model and settings). Returns
+    [lens of A, lens of B] (dicts K, dist, source) or None."""
+    import glob
+    import video_source as vs
+    want = [vs.camera_serial(video_a), vs.camera_serial(video_b)]
+    if None in want:
+        return None
+    found, best = [None, None], [9.0, 9.0]
+    files = glob.glob(os.path.join(results_dir or sa.RESULTS_DIR, '*', '*', 'cameras_board.json'))
+    for path in files:
+        if exclude and os.path.abspath(path) == os.path.abspath(exclude):
+            continue
+        try:
+            with open(path) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if 'lenses from an earlier' in d.get('method', '') or not calibration_ok(d) or \
+                max(d.get('lens_rms_px') or [9]) > 1.6:
+            continue
+        for i, (cam, key) in enumerate((('a', 'camera_a'), ('b', 'camera_b'))):
+            serial = d.get(f'serial_{cam}') or vs.camera_serial(d.get(f'video_{cam}', ''))
+            for v in range(2):
+                if serial == want[v] and d['lens_rms_px'][i] < best[v]:     # the best fit of that camera's lens
+                    best[v] = d['lens_rms_px'][i]
+                    name = os.path.relpath(os.path.dirname(path), results_dir or sa.RESULTS_DIR)
+                    found[v] = dict(K=d[key]['K'], dist=d[key]['dist'], source=f'camera {"AB"[v]} from {name}')
+    return found if None not in found else None
 
 
 def _scan_switches(path, start_min, minutes, progress, should_stop):

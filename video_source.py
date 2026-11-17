@@ -330,6 +330,24 @@ def video_format(path):
     return None
 
 
+def camera_serial(path):
+    """The GoPro's serial number written in the video file (e.g. 'C3531325930532'), or None."""
+    import re
+    import timecode as tc   # the MP4 box reader lives there
+    try:
+        with open(path, 'rb') as f:
+            moov = tc._child(f, 0, os.path.getsize(path), 'moov')
+            if moov is None:
+                return None
+            start, end = moov
+            f.seek(start)
+            data = f.read(min(end - start, 64 * 1024 * 1024))
+    except (OSError, ValueError, IndexError):
+        return None
+    m = re.search(rb'C\d{13}', data)
+    return m.group().decode() if m else None
+
+
 def camera_notes(info, fmt):
     """Hints about a camera's settings (one chapter's info from VideoSource + video_format) for the lab setup."""
     out = []

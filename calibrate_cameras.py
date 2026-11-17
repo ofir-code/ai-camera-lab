@@ -314,7 +314,7 @@ def _grid_neighbors(ids):
 
 
 def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, start_s=0.0, seconds=60.0,
-                    per_second=4.0, progress=None, should_stop=None):
+                    per_second=4.0, progress=None, should_stop=None, lenses=None):
     """Board calibration of two cameras. Returns a dict with the cameras (K, dist, size, R, t in cm), the
     numbers of frames with the board, the fit errors, the check (reconstructed square size, reprojection
     error) and warnings."""
@@ -365,14 +365,14 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
     # can't tell a camera's lens: then one lens model shared by both cameras (same model and settings)
     both = set(seen[0]) & set(seen[1])                 # the moments both cameras saw it
     moved = [_board_movement({k: seen[v][k] for k in both}) for v in range(2)]
-    if len(both) >= 3 and max(moved) < STATIC_BOARD_PX:
+    if lenses is None and len(both) >= 3 and max(moved) < STATIC_BOARD_PX:
         return _calibrate_static_board([{k: seen[v][k] for k in both} for v in range(2)], board_xyz, sizes,
                                        offset_s, times, square_mm, moved, warnings)
 
     # Each camera's lens (focal length, distortion) from its own board views (up to 60, spread over time); views
     # that fit far worse than the rest (a wrong detection, a blurred board) are dropped and the fit redone
     cams, lens_rms, dropped = [], [], 0
-    for v in range(2):
+    for v in range(2 if lenses is None else 0):
         keys = sorted(seen[v])
         keys = keys[::max(1, len(keys) // 60)]
         obj = [board_xyz[seen[v][k][1]].astype(np.float32) for k in keys]
@@ -384,6 +384,11 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
         dropped += len(bad)
         cams.append(dict(K=K, dist=dist, size=sizes[v]))
         lens_rms.append(float(rms))
+    if lenses is not None:        # each camera's lens from an earlier calibration of the same camera
+        for v in range(2):
+            cams.append(dict(K=np.asarray(lenses[v]['K'], float), dist=np.asarray(lenses[v]['dist'], float).reshape(-1, 1),
+                             size=sizes[v]))
+            lens_rms.append(float('nan'))
 
     # Where camera B is: the moments both cameras saw the board (the same corners in both)
     obj_s, img_a, img_b, common_ids = [], [], [], []
@@ -433,6 +438,8 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
     if res['stereo_rms_px'] > 1.0:
         warnings.append(f"Stereo fit error {res['stereo_rms_px']:.2f} px (> 1 px) - check the offset (wrong pairing "
                         'of frames) and that the board is flat.')
+    if lenses is not None:
+        res['lens_from'] = [l.get('source', '') for l in lenses]
     for v in range(2):
         if lens_rms[v] > 1.0:
             warnings.append(f'Camera {"AB"[v]} lens fit error {lens_rms[v]:.2f} px (> 1 px).')
@@ -442,7 +449,7 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
         res['views_dropped'] = dropped
     res['warnings'] = warnings
     res['ok'] = not warnings
-    res['method'] = 'board (moving)'
+    res['method'] = 'board (moving)' if lenses is None else 'board, lenses from an earlier calibration'
     return res
 
 
@@ -542,6 +549,7 @@ def save_board_calibration(path, res, video_a, video_b):
     ca, cb = res['cameras']
     save_cameras(path, ca, cb, res['R'], res['t_cm'], 'cm', res.get('method', 'board'),
                  dict(video_a=os.path.abspath(video_a), video_b=os.path.abspath(video_b),
+                      serial_a=vs.camera_serial(video_a), serial_b=vs.camera_serial(video_b),
                       **{k: res[k] for k in ('frames_a', 'frames_b', 'frames_both', 'lens_rms_px', 'stereo_rms_px',
                                              'distance_cm', 'square_mm', 'square_mean_mm', 'square_sd_mm',
                                              'reprojection_px', 'offset_s', 'sample_window_s', 'warnings')}))
@@ -554,11 +562,12 @@ def board_report(res):
     Returns: several lines of text: how many frames had the board, fit errors, distance between the cameras,
     the size check of the squares, and PASS or the warnings.
     """
-    lines = [f"Method: {res.get('method', 'board')}.",
+    lines = [f"Method: {res.get('method', 'board')}" + (f" ({', '.join(res['lens_from'])})" if res.get('lens_from') else '') + '.',
              f"Board found in {res['frames_a']} frames of A, {res['frames_b']} of B, {res['frames_both']} of both."
              + (f" {res['views_dropped']} view(s) left out (they fit far worse than the rest)." if res.get('views_dropped') else ''),
-             f"Lens fit error: A {res['lens_rms_px'][0]:.2f} px, B {res['lens_rms_px'][1]:.2f} px; "
-             f"stereo fit error {res['stereo_rms_px']:.2f} px.",
+             (f"Lens fit error: A {res['lens_rms_px'][0]:.2f} px, B {res['lens_rms_px'][1]:.2f} px; "
+              if not res.get('lens_from') else 'Lenses from an earlier calibration of the same cameras; ')
+             + f"stereo fit error {res['stereo_rms_px']:.2f} px.",
              f"Cameras are {res['distance_cm']:.1f} cm apart.",
              f"Check: squares measure {res['square_mean_mm']:.2f} ± {res['square_sd_mm']:.2f} mm "
              f"(entered {res['square_mm']:.1f} mm); mean reprojection error {res['reprojection_px']:.2f} px."]
