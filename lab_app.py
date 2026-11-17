@@ -619,9 +619,22 @@ class DayView(QtWidgets.QWidget):
         bot.addStretch()
         bot.addWidget(self.b_sw_done)
         v.addLayout(bot)
+        area = QtWidgets.QHBoxLayout()
+        b_area = QtWidgets.QPushButton('Draw the participant area…')
+        b_area.setToolTip('A box around the participant, her chair and the table (head to feet, all switches): '
+                          'MediaPipe looks only there, so it can\'t jump to someone else walking by')
+        b_area.clicked.connect(self.draw_area)
+        b_noarea = QtWidgets.QPushButton('Whole picture')
+        b_noarea.clicked.connect(lambda: self.set_area(None))
+        self.l_area = QtWidgets.QLabel()
+        for x in (b_area, b_noarea, self.l_area):
+            area.addWidget(x)
+        area.addStretch()
+        v.addLayout(area)
         self.redraw_index = None
+        self.drawing_area = False
         self.boxes_edited = False
-        self.edit_widgets += [b_flip, b_redraw, b_del, b_add, b_find, self.b_sw_done]
+        self.edit_widgets += [b_flip, b_redraw, b_del, b_add, b_find, self.b_sw_done, b_area, b_noarea]
         return w
 
     def sw_cam(self):
@@ -644,7 +657,9 @@ class DayView(QtWidgets.QWidget):
         if getattr(self, '_frame_key', None) != key:
             self._frame = read_frame(st[f'cam_{cam}'])
             self._frame_key = key
-        self.boxview.show_frame(self._frame, boxes)
+        self.boxview.show_frame(self._frame, boxes, st.get(f'roi_{cam}'))
+        self.l_area.setText(f'Camera {cam.upper()}: ' + ('MediaPipe looks only inside the dashed box.'
+                            if st.get(f'roi_{cam}') else 'MediaPipe looks at the whole picture.'))
         n = len(boxes or [])
         self.l_sw.setText(f'  {n} of {ek.N_SWITCHES} switches. Numbered 1-5 from the subject\'s RIGHT to LEFT - use '
                           'Flip if it\'s the other way. A box should include the light.')
@@ -670,7 +685,28 @@ class DayView(QtWidgets.QWidget):
         self.boxview.start_drawing()
         self.l_sw.setText('  Drag a box around the switch (include its light).')
 
+    def draw_area(self):
+        if self.st is None:
+            return
+        self.drawing_area = True
+        self.boxview.start_drawing()
+        self.l_sw.setText('  Drag a box around the participant, her chair and the table: head to feet, all 5 switches.')
+
+    def set_area(self, box):
+        """The participant area of the chosen camera (None = the whole picture): processing is redone."""
+        if self.st is None or self.st.get(f'roi_{self.sw_cam()}') == box:
+            return
+        self.st[f'roi_{self.sw_cam()}'] = box
+        pl.mark_todo(self.st, 'processing')
+        self.save()
+        self.session = None
+        self.refresh()
+
     def on_box_drawn(self, box):
+        if self.drawing_area:
+            self.drawing_area = False
+            self.set_area(box)
+            return
         boxes = list(self.st.get(f'boxes_{self.sw_cam()}') or [])
         if self.redraw_index is None:
             boxes = ek.sort_switches(boxes + [box])

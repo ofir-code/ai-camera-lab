@@ -89,6 +89,35 @@ def triangulate_px(pa, pb, Ka, Kb, R, t, dist_a=np.zeros(5), dist_b=np.zeros(5))
     return (X[:3] / X[3]).T
 
 
+AGREE_FRACTION = 0.0065     # both views' points meet in 3D within this x the image size (25 px at 4K)
+DISAGREE_FACTOR = 4.0       # confident points this many times further apart: one view is wrong (e.g. another person)
+
+
+def track_3d(pa, pb, raw_a, raw_b, ca, cb):
+    """3D marker track from two cameras. pa / pb: the points MediaPipe is sure of (NaN otherwise); raw_a / raw_b:
+    all its points, sure or not. A moment is used when both views are sure (unless their points clearly don't
+    meet in 3D - one view is on something else), or when both views' points meet in 3D even though MediaPipe was
+    unsure (an unusual pose, e.g. a leg on the table, lowers its confidence without moving the point).
+    Returns (X: frames x 3, NaN where not used; how: array of '' / 'sure' / 'agree')."""
+    n = len(pa)
+    X = np.full((n, 3), np.nan)
+    how = np.full(n, '', dtype=object)
+    ok = ~np.isnan(raw_a[:, 0]) & ~np.isnan(raw_b[:, 0])
+    if not ok.any():
+        return X, how
+    Xr = triangulate_px(raw_a[ok], raw_b[ok], ca['K'], cb['K'], cb['R'], cb['t'], ca['dist'], cb['dist'])
+    err = np.maximum(np.linalg.norm(project(Xr, ca['K'], ca['dist'], np.eye(3), np.zeros(3)) - raw_a[ok], axis=1),
+                     np.linalg.norm(project(Xr, cb['K'], cb['dist'], cb['R'], cb['t']) - raw_b[ok], axis=1))
+    tol = AGREE_FRACTION * max(max(ca['size']), max(cb['size']))
+    sure = (~np.isnan(pa[:, 0]) & ~np.isnan(pb[:, 0]))[ok]
+    use = (sure & (err < DISAGREE_FACTOR * tol)) | (err < tol)
+    idx = np.nonzero(ok)[0]
+    X[idx[use]] = Xr[use]
+    how[idx[use & sure]] = 'sure'
+    how[idx[use & ~sure]] = 'agree'
+    return X, how
+
+
 # -----------------------------
 # Board
 # -----------------------------
@@ -340,14 +369,19 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
         return _calibrate_static_board([{k: seen[v][k] for k in both} for v in range(2)], board_xyz, sizes,
                                        offset_s, times, square_mm, moved, warnings)
 
-    # Each camera's lens (focal length, distortion) from its own board views (up to 60, spread over time)
-    cams, lens_rms = [], []
+    # Each camera's lens (focal length, distortion) from its own board views (up to 60, spread over time); views
+    # that fit far worse than the rest (a wrong detection, a blurred board) are dropped and the fit redone
+    cams, lens_rms, dropped = [], [], 0
     for v in range(2):
         keys = sorted(seen[v])
-        views = [seen[v][k] for k in keys[::max(1, len(keys) // 60)]]
-        obj = [board_xyz[ids].astype(np.float32) for _, ids in views]
-        img = [c.astype(np.float32) for c, _ in views]
-        rms, K, dist, _, _ = cv2.calibrateCamera(obj, img, sizes[v], None, None, flags=cv2.CALIB_FIX_K3)
+        keys = keys[::max(1, len(keys) // 60)]
+        obj = [board_xyz[seen[v][k][1]].astype(np.float32) for k in keys]
+        img = [seen[v][k][0].astype(np.float32) for k in keys]
+        rms, K, dist, bad = _robust_fit(lambda o, i: cv2.calibrateCameraExtended(
+            o, i, sizes[v], None, None, flags=cv2.CALIB_FIX_K3), obj, img)
+        for i in bad:                      # not used for the stereo step either
+            seen[v].pop(keys[i], None)
+        dropped += len(bad)
         cams.append(dict(K=K, dist=dist, size=sizes[v]))
         lens_rms.append(float(rms))
 
@@ -365,10 +399,19 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
     if len(obj_s) < 5:
         raise ValueError(f'Both cameras saw the board at the same moment in only {len(obj_s)} frames - need 5+ '
                          '(hold it where both cameras see it; check the offset).')
-    rms, _, _, _, _, R, t, _, _ = cv2.stereoCalibrate(obj_s, img_a, img_b, cams[0]['K'], cams[0]['dist'],
-                                                     cams[1]['K'], cams[1]['dist'], sizes[0],
-                                                     flags=cv2.CALIB_FIX_INTRINSIC)
-    t = t.ravel()
+    def stereo(o, ia, ib):
+        r = cv2.stereoCalibrateExtended(o, ia, ib, cams[0]['K'], cams[0]['dist'], cams[1]['K'], cams[1]['dist'],
+                                        sizes[0], np.eye(3), np.zeros((3, 1)), flags=cv2.CALIB_FIX_INTRINSIC)
+        return r[0], r[5], r[6], r[-1].max(axis=1)      # rms, R, t, per pair: the worse of the two views
+    rms, R, t, bad = _robust_fit(lambda o, ab: stereo(o, [x[0] for x in ab], [x[1] for x in ab]), obj_s,
+                                 list(zip(img_a, img_b)), errors_last=True)
+    for i in sorted(bad, reverse=True):
+        del obj_s[i], img_a[i], img_b[i], common_ids[i]
+    dropped += len(bad)
+    if not np.isfinite(rms) or not np.all(np.isfinite(t)):
+        raise ValueError('The two cameras could not be placed from the board views (the fit did not converge) - '
+                         'film the board again: slowly, whole in both cameras, at a few tilts.')
+    t = np.asarray(t).ravel()
 
     # Check: triangulate the corners and measure the squares
     sq, reproj = [], []
@@ -395,10 +438,31 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
             warnings.append(f'Camera {"AB"[v]} lens fit error {lens_rms[v]:.2f} px (> 1 px).')
     if abs(res['square_mean_mm'] - square_mm) > 0.02 * square_mm:
         warnings.append(f"The squares come out {res['square_mean_mm']:.1f} mm instead of {square_mm:.1f} mm.")
+    if dropped:
+        res['views_dropped'] = dropped
     res['warnings'] = warnings
     res['ok'] = not warnings
     res['method'] = 'board (moving)'
     return res
+
+
+def _robust_fit(fit, obj, img, rounds=3, errors_last=False):
+    """Run an OpenCV calibration `fit(obj, img)` (calibrateCameraExtended-style: rms first, per-view errors last),
+    dropping views whose error is far above the others' (> 3 x the median and > 2 px) and fitting again.
+    Returns (rms, first result, second result, indices of the dropped views) - for calibrateCameraExtended
+    (rms, K, dist, dropped); with errors_last the fit returns (rms, a, b, per-view errors)."""
+    keep = list(range(len(obj)))
+    for _ in range(rounds):
+        r = fit([obj[i] for i in keep], [img[i] for i in keep])
+        errs = np.asarray(r[3] if errors_last else r[-1]).ravel()
+        a, b = (r[1], r[2])
+        lim = max(3 * float(np.median(errs)), 2.0)
+        bad = errs > lim
+        if not bad.any() or len(keep) - bad.sum() < 5:
+            break
+        keep = [k for k, x in zip(keep, bad) if not x]
+    dropped = sorted(set(range(len(obj))) - set(keep))
+    return r[0], a, b, dropped
 
 
 def _spread_view(xyz, min_ratio=0.15):
@@ -491,7 +555,8 @@ def board_report(res):
     the size check of the squares, and PASS or the warnings.
     """
     lines = [f"Method: {res.get('method', 'board')}.",
-             f"Board found in {res['frames_a']} frames of A, {res['frames_b']} of B, {res['frames_both']} of both.",
+             f"Board found in {res['frames_a']} frames of A, {res['frames_b']} of B, {res['frames_both']} of both."
+             + (f" {res['views_dropped']} view(s) left out (they fit far worse than the rest)." if res.get('views_dropped') else ''),
              f"Lens fit error: A {res['lens_rms_px'][0]:.2f} px, B {res['lens_rms_px'][1]:.2f} px; "
              f"stereo fit error {res['stereo_rms_px']:.2f} px.",
              f"Cameras are {res['distance_cm']:.1f} cm apart.",

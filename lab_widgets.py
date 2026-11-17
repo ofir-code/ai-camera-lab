@@ -107,10 +107,11 @@ class BoxView(QtWidgets.QGraphicsView):
         self.start = None
         self.rubber = None
 
-    def show_frame(self, bgr, boxes):
+    def show_frame(self, bgr, boxes, area=None):
         """Show a frame with the switch boxes drawn on it (yellow, numbered 1, 2, 3 ...).
 
-        Inputs: bgr - the frame (None = show nothing); boxes - switch boxes as [x0, y0, x1, y1] fractions of the frame.
+        Inputs: bgr - the frame (None = show nothing); boxes - switch boxes as [x0, y0, x1, y1] fractions of the frame;
+        area - the participant area (same form, drawn dashed in cyan), or None.
         """
         self.scene().clear()
         self.rubber = None
@@ -128,6 +129,13 @@ class BoxView(QtWidgets.QGraphicsView):
             t = self.scene().addSimpleText(str(k + 1), font)
             t.setBrush(QtGui.QColor('#ffd400'))
             t.setPos(x0 * w, y0 * h - font.pixelSize() * 1.3)
+        if area:
+            x0, y0, x1, y1 = area
+            apen = QtGui.QPen(QtGui.QColor('#00e5ff'), max(3, w // 400), Qt.DashLine)
+            self.scene().addRect(x0 * w, y0 * h, (x1 - x0) * w, (y1 - y0) * h, apen)
+            t = self.scene().addSimpleText('participant area', font)
+            t.setBrush(QtGui.QColor('#00e5ff'))
+            t.setPos(x0 * w + 8, y0 * h + 4)
         self.fitInView(self.scene().sceneRect(), Qt.KeepAspectRatio)
 
     def resizeEvent(self, e):

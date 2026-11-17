@@ -58,12 +58,13 @@ MEASURES = ['responsetime', 'movementtime', 'straighlinedeviation', 'numpeaks', 
 SPIKE_FRACTION = 0.03            # a point > 3% of the image size away from its neighbours' median is a glitch
 
 
-def marker_track(pose, limb, side, image_size=None):
-    """(frames, 2) marker position (NaN where MediaPipe isn't sure, or where it jumps for a single frame or two
-    - a glitch, not a movement: compared with the median of the 5 frames around it)."""
+def marker_track(pose, limb, side, image_size=None, min_visibility=MIN_VISIBILITY):
+    """(frames, 2) marker position (NaN where MediaPipe isn't sure - visibility below min_visibility - or where
+    it jumps for a single frame or two - a glitch, not a movement: compared with the median of the 5 frames
+    around it)."""
     j = MARKER[limb][side]
     xy = pose[:, j, :2].astype(float).copy()
-    xy[~(pose[:, j, 2] >= MIN_VISIBILITY)] = np.nan
+    xy[~(pose[:, j, 2] >= min_visibility)] = np.nan
     if image_size is not None and len(xy) >= 5:
         pad = np.pad(xy, ((2, 2), (0, 0)), mode='edge')
         with warnings.catch_warnings():   # all-NaN stretches (marker not seen) are expected

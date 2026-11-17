@@ -23,6 +23,8 @@ import os
 import shutil
 import time
 import traceback
+
+import numpy as np
 from dataclasses import asdict
 
 import experiment_design as ed
@@ -281,7 +283,7 @@ def set_videos(pid, day, cam_a, cam_b=None, results_dir=None):
         paths = [paths[1], '']
     if (paths[0], paths[1]) != (st['cam_a'], st.get('cam_b') or ''):
         st['cam_a'], st['cam_b'] = paths
-        st.update(boxes_a=None, boxes_b=None, offset_s=0.0, offset_source='timecode', calibration='',
+        st.update(boxes_a=None, boxes_b=None, roi_a=None, roi_b=None, offset_s=0.0, offset_source='timecode', calibration='',
                   calibration_source='auto', parts_override=None, touse_override={}, video_notes={})
         mark_todo(st, 'videos')
     _apply_participant(st, p)
@@ -295,6 +297,7 @@ def swap_cameras(st, results_dir=None):
         return st
     st['cam_a'], st['cam_b'] = st['cam_b'], st['cam_a']
     st['boxes_a'], st['boxes_b'] = st.get('boxes_b'), st.get('boxes_a')
+    st['roi_a'], st['roi_b'] = st.get('roi_b'), st.get('roi_a')
     st['offset_s'] = -st.get('offset_s', 0.0)
     if st.get('calibration_source') == 'auto':
         st['calibration'] = ''
@@ -496,6 +499,12 @@ def step_calibration(st, progress, should_stop, results_dir=None):
                 raise Stopped()
             errors.append(f'{where}: {e}')
             continue
+        # A fit that came out wrong (nonsense stereo error, squares far off) is not used
+        if not (np.isfinite(res['stereo_rms_px']) and res['reprojection_px'] < 5 and
+                abs(res['square_mean_mm'] - res['square_mm']) < 1.5 and res['square_sd_mm'] < 1.5):
+            errors.append(f'{where}: the fit came out wrong (reprojection {res["reprojection_px"]:.1f} px, squares '
+                          f'{res["square_mean_mm"]:.1f} ± {res["square_sd_mm"]:.1f} mm) - not used.')
+            continue
         path = os.path.join(day_dir(st['subject'], st['session'], results_dir), 'cameras_board.json')
         cc.save_board_calibration(path, res, va, vb)
         st['calibration'] = path
@@ -572,17 +581,18 @@ def step_processing(st, progress, should_stop, results_dir=None):
         path, boxes = st[f'cam_{c}'], st.get(f'boxes_{c}')
         if not boxes:
             raise ValueError(f'Camera {c.upper()} has no switches marked.')
-        model = st.get('pose_model', 'full')
-        cache = se.load_cache(path, out, boxes, model)
+        model, roi = st.get('pose_model', 'full'), st.get(f'roi_{c}')
+        cache = se.load_cache(path, out, boxes, model, roi)
         if cache is None or not cache['meta'].get('complete'):
             t0 = time.time()
-            cache = se.process_video(path, boxes, out, should_stop=should_stop, model=model,
+            cache = se.process_video(path, boxes, out, should_stop=should_stop, model=model, roi=roi,
                                      progress=lambda n, tot, left, i=i: progress(
                                          (i + n / max(tot, 1)) / len(cams),
                                          f'camera {c.upper()}' + (f', {left / 60:.0f} min left' if left else '')))
             if should_stop():
                 raise Stopped()
-            details.append(f'Camera {c.upper()}: {cache["meta"]["frames"]} frames in {(time.time() - t0) / 60:.1f} min.')
+            details.append(f'Camera {c.upper()}: {cache["meta"]["frames"]} frames in {(time.time() - t0) / 60:.1f} min'
+                           + (' (MediaPipe only in the participant area).' if roi else '.'))
         else:
             details.append(f'Camera {c.upper()}: {cache["meta"]["frames"]} frames (processed before).')
         gaps = [x for x in cache['meta'].get('seams') or [] if x.get('missing')]
@@ -618,6 +628,11 @@ def step_analysis(st, progress, should_stop, results_dir=None):
                f'{len(found)} trials found: {hits} hits, ' + ', '.join(f'{v} {k.replace("_", " ")}'
                                                                      for k, v in flags.items() if v),
                'Data: ' + s.units]
+    for (limb, side), how in (getattr(s, 'track3_how', None) or {}).items():
+        sure, agree = int(np.sum(how == 'sure')), int(np.sum(how == 'agree'))
+        if sure + agree:
+            details.append(f'3D {side} {"wrist" if limb == "upper" else "ankle"}: {sure + agree} frames '
+                           f'({agree} of them where MediaPipe was unsure but both cameras agree).')
     details += [f'! {w}' for w in res['warnings']]
     status = STATUS_WARN if res['warnings'] or parts != {k: v for k, v in planned.items() if v} else STATUS_OK
     return status, f'{len(found)} trials in {sum(parts.values())} blocks.', details, s

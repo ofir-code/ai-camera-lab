@@ -76,6 +76,8 @@ def template_of(state):
 
     Input: state - the session's settings. Returns: a list of experiment_design.Part.
     """
+    if state.get('custom_parts'):        # a recording with its own order of parts (e.g. a camera test)
+        return [ed.Part(p['name'], int(p['blocks']), p['limb'], p['side']) for p in state['custom_parts']]
     d = state['design']
     return ed.session_template(d['tested_side'], d['contralateral'], d['practice_limb'], d['practice_side'],
                                d.get('retest', False), d.get('familiarization', 'practice'))
@@ -127,7 +129,7 @@ class Session:
         for c in ('a', 'b'):
             if state.get(f'cam_{c}') and state.get(f'boxes_{c}'):
                 cache = se.load_cache(state[f'cam_{c}'], self.folder, state[f'boxes_{c}'],
-                                      state.get('pose_model', 'full'))
+                                      state.get('pose_model', 'full'), state.get(f'roi_{c}'))
                 if cache is not None:
                     self.cams[c] = cache
         self.A, self.B = self.cams.get('a'), self.cams.get('b')
@@ -179,10 +181,10 @@ class Session:
         out[ok] = arr[i[ok]]
         return out
 
-    def track_2d(self, c, key):
+    def track_2d(self, c, key, min_visibility=tm.MIN_VISIBILITY):
         """Marker of camera c on the session timeline, in that camera's first-frame image coordinates."""
         cache = self.cams[c]
-        xy = tm.marker_track(cache['pose'], *key, cache['meta']['size'])
+        xy = tm.marker_track(cache['pose'], *key, cache['meta']['size'], min_visibility)
         xy = ek.to_first_frame(xy, cache['motion'][:len(xy)])
         return self.per_frame(c, xy)
 
@@ -238,18 +240,16 @@ class Session:
             sources.append(dict(name=f'camera {c.upper()}', cam=c, switch_pos=centers, switch_size=sizes,
                                 track={k: self.track_2d(c, k) for k in keys}))
         if self.two_cameras:
-            from calibrate_cameras import load_cameras, triangulate_px
+            from calibrate_cameras import load_cameras, track_3d, triangulate_px
             (ca, cb), cal_units = load_cameras(st['calibration'])
             tri = lambda pa, pb: triangulate_px(pa, pb, ca['K'], cb['K'], cb['R'], cb['t'], ca['dist'], cb['dist'])
             sa_, sb_ = sources
-            track3 = {}
+            track3, self.track3_how = {}, {}
             for k in keys:
-                pa, pb = sa_['track'][k], sb_['track'][k]
-                ok = ~np.isnan(pa[:, 0]) & ~np.isnan(pb[:, 0])
-                X = np.full((n, 3), np.nan)
-                if ok.any():
-                    X[ok] = tri(pa[ok], pb[ok])
-                track3[k] = X
+                # sure points of both views, or unsure ones whose two views meet in 3D (calibrate_cameras.track_3d)
+                X, how = track_3d(sa_['track'][k], sb_['track'][k], self.track_2d('a', k, 0.0),
+                                  self.track_2d('b', k, 0.0), ca, cb)
+                track3[k], self.track3_how[k] = X, how
             sources.insert(0, dict(name='3D', cam=None, switch_pos=tri(sa_['switch_pos'], sb_['switch_pos']),
                                    switch_size=np.ones(len(sa_['switch_pos'])), track=track3))
             units = f'3D, {cal_units} (trials marked camera A/B: px of that camera)'

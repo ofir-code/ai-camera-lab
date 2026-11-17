@@ -132,6 +132,36 @@ class _Prefetch:
         self.thread.join()
 
 
+def roi_pixels(roi, w, h):
+    """The participant area (x0, y0, x1, y1 as fractions of the frame, or None) in whole pixels, or None."""
+    if not roi:
+        return None
+    x0, y0, x1, y1 = [int(round(v * s)) for v, s in zip(roi, (w, h, w, h))]
+    x0, x1 = sorted((max(0, min(w, x0)), max(0, min(w, x1))))
+    y0, y1 = sorted((max(0, min(h, y0)), max(0, min(h, y1))))
+    return (x0, y0, x1, y1) if x1 - x0 >= 32 and y1 - y0 >= 32 else None
+
+
+def pose_input(frame, rgb_small, area):
+    """The picture MediaPipe gets: the whole (shrunk) frame, or only the participant area cut from the full-size
+    frame (so the person also gets more pixels), shrunk to MP_MAX_SIDE at most."""
+    if area is None:
+        return rgb_small
+    x0, y0, x1, y1 = area
+    crop = frame[y0:y1, x0:x1]
+    sc = min(1.0, MP_MAX_SIDE / max(crop.shape[:2]))
+    if sc < 1:
+        crop = cv2.resize(crop, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+
+
+def landmarks_to_pixels(landmarks, w, h, area=None):
+    """MediaPipe's landmarks (x, y as fractions of the picture it got, visibility) -> 33 x 3: x, y in the whole
+    frame's pixels and visibility."""
+    x0, y0, x1, y1 = area if area is not None else (0, 0, w, h)
+    return np.array([[x0 + lm.x * (x1 - x0), y0 + lm.y * (y1 - y0), lm.visibility] for lm in landmarks])
+
+
 def cache_path(video_path, out_dir):
     """The file name of a video's cache (its per-frame data): <out_dir>/<video name>_session.npz.
 
@@ -140,7 +170,7 @@ def cache_path(video_path, out_dir):
     return os.path.join(out_dir, os.path.splitext(os.path.basename(video_path))[0] + '_session.npz')
 
 
-def load_cache(video_path, out_dir, boxes=None, model=None):
+def load_cache(video_path, out_dir, boxes=None, model=None, roi='any'):
     """The cached per-frame data, or None if missing/outdated (other video file, other switch boxes, or - when
     `model` is given - made with another pose model)."""
     path = cache_path(video_path, out_dir)
@@ -153,6 +183,8 @@ def load_cache(video_path, out_dir, boxes=None, model=None):
     if boxes is not None and (np.shape(meta['boxes']) != np.shape(boxes) or not np.allclose(meta['boxes'], boxes)):
         return None
     if model is not None and meta.get('pose_model', 'full') != model:
+        return None
+    if roi != 'any' and (meta.get('roi') or None) != (list(roi) if roi else None):
         return None
     if not meta.get('complete'):   # older caches used a too strict test: check against the video's length
         src = vs.VideoSource(video_path, hardware=False)
@@ -173,6 +205,7 @@ def _process_range(job, stop=None):
     video_path, boxes, t_start, t_end, out_file, counter = job[:6]   # this part: frames with t_start <= ms < t_end
     threads = job[6] if len(job) > 6 else 0
     complexity = POSE_MODELS[job[7] if len(job) > 7 else 'full']
+    roi = job[8] if len(job) > 8 else None
     cap = open_video(video_path, threads)
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     ok, first = cap.read()
@@ -182,6 +215,7 @@ def _process_range(job, stop=None):
     if t_start > 1000:
         cap.set(cv2.CAP_PROP_POS_MSEC, t_start - 1000)
     scale = min(1.0, MP_MAX_SIDE / max(w, h))
+    area = roi_pixels(roi, w, h)
     n_sw = len(boxes)
     light_corners, touch_corners, sizes = ek.switch_geometry(boxes, w, h)
     times, pose, motion, light, tu, tl = [], [], [], [], [], []
@@ -198,8 +232,8 @@ def _process_range(job, stop=None):
                     camera.update(frame)
                 motion.append(camera.M.copy())
                 rgb.flags.writeable = False
-                r = model.process(rgb)
-                p = (np.array([[lm.x * w, lm.y * h, lm.visibility] for lm in r.pose_landmarks.landmark])
+                r = model.process(pose_input(frame, rgb, area))
+                p = (landmarks_to_pixels(r.pose_landmarks.landmark, w, h, area)
                      if r.pose_landmarks else np.full((33, 3), np.nan))
                 pose.append(p)
                 lv, du, dl = np.zeros(n_sw), np.full(n_sw, np.inf), np.full(n_sw, np.inf)
@@ -226,10 +260,12 @@ def _process_range(job, stop=None):
     return out_file
 
 
-def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, workers=None, model='full'):
+def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, workers=None, model='full',
+                  roi=None):
     """Run the pass (in parallel parts) and save the cache. `progress(done_frames, total, seconds_left)` is
     called now and then; `should_stop()` -> True stops it (nothing is saved). model: 'full' or 'heavy'
-    (POSE_MODELS). Returns the cache dict."""
+    (POSE_MODELS). roi: the participant area [x0, y0, x1, y1] (fractions) - MediaPipe looks only there (so it
+    can't jump to someone else in the picture); None = the whole frame. Returns the cache dict."""
     if model not in POSE_MODELS:
         raise ValueError(f'Unknown pose model {model!r} - use one of {list(POSE_MODELS)}')
     src = vs.VideoSource(video_path, hardware=False)    # all chapters of a GoPro clip
@@ -246,7 +282,9 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
     counter = ctx.Value('i', 0)
     parts = [os.path.join(out_dir, f'.{stem}_part{k}.npz') for k in range(workers)]
     threads = decoder_threads(workers)
-    jobs = [(video_path, boxes, edges[k], edges[k + 1], parts[k], counter, threads, model) for k in range(workers)]
+    roi = [round(float(v), 4) for v in roi] if roi else None
+    jobs = [(video_path, boxes, edges[k], edges[k + 1], parts[k], counter, threads, model, roi)
+            for k in range(workers)]
     t0 = time.time()
     if workers == 1:
         stop_thread, errors = threading.Event(), []
@@ -303,7 +341,7 @@ def process_video(video_path, boxes, out_dir, progress=None, should_stop=None, w
                 chapters=[os.path.basename(p) for p in src.paths],
                 boxes=boxes, frames=len(d['times']), complete=_complete(len(d['times']), src, fps),
                 seconds=round(time.time() - t0, 1), workers=workers, decoder='+'.join(decoders), seams=seams,
-                pose_model=model)
+                pose_model=model, roi=roi)
     np.savez_compressed(cache_path(video_path, out_dir), meta=json.dumps(meta), **d)
     d['meta'] = meta
     return d

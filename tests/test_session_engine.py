@@ -151,6 +151,21 @@ class ProcessVideo(unittest.TestCase):
         np.testing.assert_array_equal(d3['times'], d1['times'])
         np.testing.assert_allclose(d3['light'], d1['light'], rtol=1e-5, atol=1e-4)
 
+    def test_participant_area(self):
+        """With a participant area the lights are the same (measured on the whole frame), the cache remembers the
+        area, and asking for another area (or none) means processing again."""
+        out = tempfile.mkdtemp(dir=self.dir)
+        roi = [0.1, 0.0, 0.9, 0.6]
+        d = se.process_video(self.single, BOXES, out, workers=1, roi=roi)
+        ref = se.process_video(self.single, BOXES, tempfile.mkdtemp(dir=self.dir), workers=1)
+        np.testing.assert_allclose(d['light'], ref['light'], rtol=1e-5, atol=1e-4)
+        self.assertEqual(d['meta']['roi'], roi)
+        self.assertIsNotNone(se.load_cache(self.single, out, BOXES, 'full', roi))
+        self.assertIsNotNone(se.load_cache(self.single, out, BOXES))                 # area not asked about
+        self.assertIsNone(se.load_cache(self.single, out, BOXES, 'full', None))
+        self.assertIsNone(se.load_cache(self.single, out, BOXES, 'full', [0, 0, 1, 1]))
+        self.assertIsNone(se.load_cache(self.single, out, BOXES, 'heavy', roi))
+
     def test_gopro_chapters(self):
         paths = [self.gopro, os.path.join(self.dir, 'GX020042.MP4')]
         d = self.check(self.gopro, paths, 3)
