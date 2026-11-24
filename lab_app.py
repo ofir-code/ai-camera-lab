@@ -18,7 +18,8 @@ import extract_kinematics as ek
 import experiment_design as ed
 import pipeline as pl
 import session_analysis as sa
-from lab_widgets import (THREAD_STACK, BlocksView, BoxView, TrialsView, Worker, group, read_frame, status_html)
+from lab_widgets import (THREAD_STACK, BlocksView, BoxView, CleaningView, TrialsView, Worker, group, read_frame,
+                         status_html)
 
 STATUS_STYLE = {pl.STATUS_TODO: ('#e9ecef', '#495057', ''), pl.STATUS_RUNNING: ('#cfe2ff', '#084298', '⟳ '),
                 pl.STATUS_OK: ('#d1e7dd', '#0f5132', '✓ '), pl.STATUS_WARN: ('#fff3cd', '#664d03', '! '),
@@ -763,7 +764,34 @@ class DayView(QtWidgets.QWidget):
         self.blocks.parts_changed.connect(self.parts_changed)
         self.trials = TrialsView()
         self.trials.touse_changed.connect(self.touse_changed)
+        self.cleaning = CleaningView()
+        self.cleaning.touse_changed.connect(self.touse_changed)
+        # Optional: the light-switch system's own times (its Excel file) instead of the lights seen in the video
+        sysrow = QtWidgets.QHBoxLayout()
+        self.e_sys_file = QtWidgets.QLineEdit()
+        self.e_sys_file.setPlaceholderText('the system\'s Excel file (optional), e.g. PROGRAM4.xlsx')
+        b_sys = QtWidgets.QPushButton('Browse…')
+        b_sys.clicked.connect(self.browse_system_file)
+        self.e_sys_code = QtWidgets.QLineEdit()
+        self.e_sys_code.setPlaceholderText('e.g. AL')
+        self.e_sys_code.setMaximumWidth(70)
+        self.b_sys_load = QtWidgets.QPushButton('Load')
+        self.b_sys_load.clicked.connect(self.load_system_file)
+        self.k_sys_use = QtWidgets.QCheckBox("Use the system's times")
+        self.k_sys_use.setToolTip('Hit / miss and light-on -> press times from the system; lights the video and the '
+                                  'system disagree on are placed by the timing. Off = the video\'s lights only.')
+        self.k_sys_use.toggled.connect(self.use_system_changed)
+        self.l_sys = QtWidgets.QLabel()
+        for x in (QtWidgets.QLabel('File'), self.e_sys_file, b_sys, QtWidgets.QLabel('Subject code (sheet names)'),
+                  self.e_sys_code, self.b_sys_load, self.k_sys_use):
+            sysrow.addWidget(x)
+        sysv = QtWidgets.QVBoxLayout()
+        sysv.addLayout(sysrow)
+        sysv.addWidget(self.l_sys)
+        v.addWidget(group('Light-switch system times (optional)', sysv))
+        self.edit_widgets += [self.e_sys_file, b_sys, self.e_sys_code, self.b_sys_load, self.k_sys_use]
         self.tabs.addTab(self.trials, 'Trials')
+        self.tabs.addTab(self.cleaning, 'Data cleaning')
         self.tabs.addTab(self.blocks, 'Blocks && parts')
         v.addWidget(self.tabs)
         self.loader = None
@@ -775,10 +803,13 @@ class DayView(QtWidgets.QWidget):
 
     def refresh_analysis(self):
         self.blocks.set_editable(not self.busy)
+        if self.st is not None:
+            self.show_system()
         if self.st is None or self.st['steps']['analysis']['status'] not in pl.DONE:
             self.session = None
             self.blocks.set_session(None)
             self.trials.set_session(None)
+            self.cleaning.set_session(None)
             return
         if self.session is not None:
             return
@@ -798,17 +829,85 @@ class DayView(QtWidgets.QWidget):
             self.session = s
             self.blocks.set_session(s)
             self.trials.set_session(s)
+            self.cleaning.set_session(s)
         self.blocks.label.setText('Loading the analysis…')
         self.loader = Worker(job)
         self.loader.done.connect(done)
         self.loader.failed.connect(lambda m: self.blocks.label.setText(f'Could not load the analysis: {m}'))
         self.loader.start()
 
+    # ----- optional: the light-switch system's times -----
+    def show_system(self):
+        """Fill the system-file controls from the day's state."""
+        sysd = (self.st or {}).get('system') or {}
+        for wdg, val in ((self.e_sys_file, sysd.get('file', '')), (self.e_sys_code, sysd.get('code', ''))):
+            if not wdg.hasFocus():
+                wdg.setText(val)
+        self.k_sys_use.blockSignals(True)
+        self.k_sys_use.setChecked(bool(sysd.get('use')))
+        self.k_sys_use.setEnabled(bool(sysd.get('sheets')) and not self.busy)
+        self.k_sys_use.blockSignals(False)
+        sheets = sysd.get('sheets') or {}
+        if not sheets:
+            self.l_sys.setText('Not used - the lights seen in the video give hit / miss and the light-on times. '
+                               'Load the system\'s file to use its times instead (e.g. while a switch\'s light is hard '
+                               'to see in the videos).')
+        else:
+            self.l_sys.setText(f'{len(sheets)} sheet(s) of {sysd.get("code")} loaded: {", ".join(sorted(sheets))}. '
+                               + ('<b>In use.</b>' if sysd.get('use') else 'Not in use (tick to use them).'))
+
+    def browse_system_file(self):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "The light-switch system's Excel file",
+                                                     os.path.dirname(self.e_sys_file.text()) or os.path.expanduser('~'),
+                                                     'Excel (*.xlsx *.xlsm)')
+        if p:
+            self.e_sys_file.setText(p)
+
+    def load_system_file(self):
+        path, code = self.e_sys_file.text().strip(), self.e_sys_code.text().strip().upper()
+        if not path or not os.path.exists(path) or not code:
+            QtWidgets.QMessageBox.warning(self, 'System file', 'Choose the Excel file and type the subject code '
+                                          '(the letters at the start of the sheet names, e.g. AL for AL-RT-H1).')
+            return
+        import system_times
+        self.l_sys.setText('Reading the file…')
+        self.b_sys_load.setEnabled(False)
+
+        def done(sheets):
+            self.b_sys_load.setEnabled(not self.busy)
+            if not sheets:
+                self.l_sys.setText(f'No sheets named {code}-RT-H1, {code}-LT-L2 … in that file.')
+                return
+            self.st['system'] = dict(use=True, file=path, code=code, sheets=sheets,
+                                     led_of_switch={str(k): v for k, v in system_times.LED_OF_SWITCH.items()})
+            self.run_again_step('analysis')
+
+        def failed(m):
+            self.b_sys_load.setEnabled(not self.busy)
+            self.l_sys.setText(f'Could not read the file: {m}')
+        self.sys_loader = Worker(lambda progress, stop: system_times.read_system_file(path, code))
+        self.sys_loader.done.connect(done)
+        self.sys_loader.failed.connect(failed)
+        self.sys_loader.start()
+
+    def use_system_changed(self, on):
+        sysd = self.st.get('system') or {}
+        if not sysd.get('sheets') or bool(sysd.get('use')) == on:
+            return
+        sysd['use'] = on
+        self.st['system'] = sysd
+        self.run_again_step('analysis')
+
     def parts_changed(self, parts):
         self.st['parts_override'] = parts
         self.run_again_step('analysis')
 
     def touse_changed(self):
+        # both lists show the same trials: keep them in step
+        if self.sender() is self.cleaning:
+            self.trials.fill()
+        elif self.sender() is self.trials:
+            self.cleaning.fill()
         pl.mark_todo(self.st, 'results')
         self.save()
         self.refresh_buttons_only()

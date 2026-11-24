@@ -32,7 +32,7 @@ def make_session(n_blocks=18, rt_s=0.5, miss_every=7, delay_s=1.0, gap_s=30.0, l
         for slot in range(30):
             target = PATTERN[slot % 6]
             miss = miss_every and (b * 30 + slot) % miss_every == miss_every - 1
-            dur = 1.0 if miss else rt_s
+            dur = 1.06 if miss else rt_s      # the video sees a 1 s timeout ~1.04-1.06 s (light-switch system)
             on, off = f(t), f(t + dur)
             truth.append(dict(block=b, slot=slot, target=target, on=on, off=off, miss=miss))
             if (b, slot) not in drop:

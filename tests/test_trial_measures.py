@@ -130,6 +130,16 @@ class Measures(unittest.TestCase):
         self.assertAlmostEqual(m['responsetime'], -m['anticipation_ms'] / 1000, places=6)
         # It is told from the movement toward the target - no home position needed
         self.assertTrue(tm.calculate_measures(k, np.array([400, 400]))['anticipation'])
+        # Jason's calculateMeasures.m searches only from the light on: never negative (here ~0)
+        self.assertGreaterEqual(m['responsetime_jason'], 0)
+        self.assertLess(m['responsetime_jason'], 0.05)
+
+    def test_jason_same_when_after_the_light(self):
+        """A reach that starts after the light: the app's RT / MT are exactly calculateMeasures.m's."""
+        t, xy = reach(stim_s=1.0, onset_s=1.25)
+        m = tm.calculate_measures(tm.trial_kinematics(t, xy, 1.0), np.array([400, 400]))
+        self.assertAlmostEqual(m['responsetime'], m['responsetime_jason'], places=9)
+        self.assertAlmostEqual(m['movementtime'], m['movementtime_jason'], places=9)
 
     def test_3d(self):
         t = np.arange(int(2.5 * FPS)) / FPS
@@ -226,3 +236,38 @@ class Summaries(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReviewTrials(unittest.TestCase):
+    """Data-cleaning flags: Clean, Repress, recommendation (exclude / check) and reasons."""
+
+    def row(self, **kw):
+        r = dict(Part='right_arm', Block=1, Sequence=1, Trial=1, Target=1, Limb='upper', Side='right', Outcome='hit',
+                 Data='3D', corrected_from=None, start_from='home', Touch_ms=1100.0, Hit_ms=1200.0,
+                 responsetime=0.2, movementtime=0.3, touse=True)
+        r.update(kw)
+        return r
+
+    def test_flags(self):
+        rows = [self.row(responsetime=0.2 + 0.001 * i, movementtime=0.3 + 0.001 * i) for i in range(20)]
+        miss = self.row(Outcome='miss', Hit_ms=None)
+        corrected = self.row(corrected_from=3)
+        repress = self.row(Touch_ms=1000.0, Hit_ms=1500.0)
+        shortcut = self.row(start_from='switch 4')
+        slow = self.row(responsetime=0.9)
+        nodata = self.row(Data='')
+        tm.review_trials(rows + [miss, corrected, repress, shortcut, slow, nodata])
+        self.assertTrue(rows[0]['Clean'])
+        self.assertEqual(rows[0]['Recommendation'], '')
+        self.assertEqual(miss['Recommendation'], 'exclude')
+        self.assertEqual(corrected['Recommendation'], 'exclude')
+        self.assertFalse(corrected['Clean'])
+        self.assertTrue(repress['repress'])
+        self.assertEqual(repress['Recommendation'], 'check')
+        self.assertFalse(repress['Clean'])
+        self.assertEqual(shortcut['Recommendation'], 'check')
+        self.assertEqual(slow['Recommendation'], 'check')
+        self.assertIn('RT', slow['Reasons'])
+        self.assertTrue(slow['Clean'])                 # unusual, but not an error
+        self.assertEqual(nodata['Recommendation'], 'exclude')
+        self.assertTrue(all(r['touse'] for r in rows))   # nothing left out automatically

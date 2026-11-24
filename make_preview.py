@@ -2,8 +2,9 @@
 MediaPipe skeleton, the switch boxes (target in yellow), the tracked wrist / ankle (red cross) and the trial's
 part / block / sequence / trial / target / outcome / RT / MT. A bar at the bottom shows the blocks of the session.
 
-    venv/bin/python make_preview.py <participant> [day] [trials per block] [heavy]
+    venv/bin/python make_preview.py <participant> [day] [trials per block] [heavy] [full]
     -> results/<participant>/<day>/<participant>_<day>_preview.mp4
+With "full", the whole session from start to end (pauses between blocks too) -> ..._full.mp4
 With "heavy", the skeleton is MediaPipe Pose's heavy model (model_complexity=2), run on the shown frames
 (the trial info and RT / MT still come from the day's analysis) -> ..._preview_heavy.mp4
 """
@@ -111,7 +112,8 @@ class LivePose:
                 if r.pose_landmarks else np.full((33, 3), np.nan))
 
 
-def make_preview(pid, day='d1', per_block=2, out=None, progress=print, complexity=None):
+def make_preview(pid, day='d1', per_block=2, out=None, progress=print, complexity=None, full=False):
+    """full=True: the whole session from start to end (pauses between blocks included) -> ..._full.mp4."""
     st = pl.load_day(pid, day)
     s = sa.Session(st)
     res = s.analyze()
@@ -119,14 +121,17 @@ def make_preview(pid, day='d1', per_block=2, out=None, progress=print, complexit
     times = s.times
     cams = [c for c in ('a', 'b') if c in s.cams]
     readers = {c: Reader(st[f'cam_{c}']) for c in cams}
-    # Clips: the first `per_block` trials of every block
-    clips = []
+    end_of = lambda r: r['off_frame'] if r['off_frame'] is not None else r['on_frame']
+    # Clips: the first `per_block` trials of every block (or the whole session)
+    clips, spans = [], []                # spans: (first frame, last frame) of each block, for "pause" in full mode
     for bi in sorted({r['block_index'] for r in trials}):
-        rows = [r for r in trials if r['block_index'] == bi][:per_block]
-        a = rows[0]['on_frame']
-        last = rows[-1]
-        b = last['off_frame'] if last['off_frame'] is not None else last['on_frame']
+        rows = [r for r in trials if r['block_index'] == bi]
+        spans.append((rows[0]['on_frame'] - int(PAD_S * s.fps), end_of(rows[-1]) + int(2 * s.fps)))
+        rows = rows[:per_block]
+        a, b = rows[0]['on_frame'], end_of(rows[-1])
         clips.append((rows, max(0, a - int(PAD_S * s.fps)), min(len(times) - 1, b + int(PAD_S * s.fps))))
+    if full:
+        clips = [(trials, 0, len(times) - 1)]
     blocks_t = []                        # for the bottom bar: (start s, end s, part)
     for bi, (part, no) in enumerate(res['parts']):
         rows = [r for r in res['trials'] if r['block_index'] == bi and r['on_frame'] is not None]
@@ -141,21 +146,24 @@ def make_preview(pid, day='d1', per_block=2, out=None, progress=print, complexit
     H = vid_h + info_h + bar_h
     live = {c: LivePose(complexity) for c in cams} if complexity is not None else None
     tag = {2: '_heavy', 0: '_lite'}.get(complexity, '')
-    out = out or os.path.join(pl.day_dir(pid, day), f'{pid}_{day}_preview{tag}.mp4')
+    out = out or os.path.join(pl.day_dir(pid, day), f'{pid}_{day}_{"full" if full else "preview"}{tag}.mp4')
+    step = max(1, int(round(s.fps / OUT_FPS)))
     writer = None
-    for codec in ('avc1', 'mp4v'):
-        writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*codec), OUT_FPS, (OUT_W, H))
+    for codec in ('avc1', 'mp4v'):   # every step-th frame, played at real-time speed
+        writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*codec), s.fps / step, (OUT_W, H))
         if writer.isOpened():
             break
-    step = max(1, int(round(s.fps / OUT_FPS)))
     n_total = sum((b - a) // step + 1 for _, a, b in clips)
     done, t0 = 0, time.time()
     for rows, a, b in clips:
+        ons = [x['on_frame'] for x in rows]
         for f in range(a, b + 1, step):
             t = times[f]
-            # the trial shown: the last one whose light came on by now
-            r = [x for x in rows if x['on_frame'] <= f]
-            r = r[-1] if r else rows[0]
+            # the trial shown: the last one whose light came on by now (none during a pause between blocks)
+            k = int(np.searchsorted(ons, f, side='right')) - 1
+            r = rows[max(k, 0)]
+            if full and not any(x0 <= f <= x1 for x0, x1 in spans):
+                r = None
             canvas = np.zeros((H, OUT_W, 3), np.uint8)
             for k, c in enumerate(cams):
                 cf = int(s.idx[c][f])
@@ -172,22 +180,25 @@ def make_preview(pid, day='d1', per_block=2, out=None, progress=print, complexit
                 canvas[:small.shape[0], k * half:k * half + half] = small
             # info
             y0 = vid_h + 45
-            lit = r['on_frame'] <= f <= (r['off_frame'] if r['off_frame'] is not None else r['on_frame'])
-            flags = []
-            if r['anticipation']:
-                flags.append((f"started {r['anticipation_ms']:.0f} ms before the light", (80, 220, 255)))
-            if r.get('start_from') not in ('', 'home', None):
-                flags.append((f"not from home ({r['start_from']})", (220, 140, 255)))
-            if r['corrected_from']:
-                flags.append((f"corrected (went to {r['corrected_from']} first)", (255, 220, 120)))
-            fmt = lambda v: '-' if v is None or (isinstance(v, float) and np.isnan(v)) else f'{v:.3f} s'
-            text_lines(canvas, [(f"{r['Part']}   block {r['Block']}   sequence {r['Sequence']}   trial {r['Trial']}"
-                                 f"   ->  switch {r['Target']}   ({r['Limb']} {r['Side']})",
-                                 PART_COLOR.get(r['Part'].replace('_contralateral', ''))),
-                                (f"{r['Outcome']}    RT {fmt(r['responsetime'])}    MT {fmt(r['movementtime'])}"
-                                 f"    data: {r.get('Data') or '-'}    light: {r.get('Light_source', '')}", None)],
-                       30, y0, 1.0)
-            text_lines(canvas, flags, 1180, y0, 0.8)
+            lit = r is not None and r['on_frame'] <= f <= end_of(r)
+            if r is None:
+                text_lines(canvas, [('pause between blocks', (200, 200, 200))], 30, y0, 1.0)
+            else:
+                flags = []
+                if r['anticipation']:
+                    flags.append((f"started {r['anticipation_ms']:.0f} ms before the light", (80, 220, 255)))
+                if r.get('start_from') not in ('', 'home', None):
+                    flags.append((f"not from home ({r['start_from']})", (220, 140, 255)))
+                if r['corrected_from']:
+                    flags.append((f"corrected (went to {r['corrected_from']} first)", (255, 220, 120)))
+                fmt = lambda v: '-' if v is None or (isinstance(v, float) and np.isnan(v)) else f'{v:.3f} s'
+                text_lines(canvas, [(f"{r['Part']}   block {r['Block']}   sequence {r['Sequence']}   trial {r['Trial']}"
+                                     f"   ->  switch {r['Target']}   ({r['Limb']} {r['Side']})",
+                                     PART_COLOR.get(r['Part'].replace('_contralateral', ''))),
+                                    (f"{r['Outcome']}    RT {fmt(r['responsetime'])}    MT {fmt(r['movementtime'])}"
+                                     f"    data: {r.get('Data') or '-'}    light: {r.get('Light_source', '')}", None)],
+                           30, y0, 1.0)
+                text_lines(canvas, flags, 1180, y0, 0.8)
             cv2.putText(canvas, f'{int(t // 60000)}:{(t / 1000) % 60:05.2f}', (OUT_W - 200, y0),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
             if lit:
@@ -211,6 +222,8 @@ def make_preview(pid, day='d1', per_block=2, out=None, progress=print, complexit
 
 if __name__ == '__main__':
     args = sys.argv[1:]
+    full = 'full' in args[1:]
+    args = [a for a in args if a != 'full']
     path = make_preview(args[0], args[1] if len(args) > 1 else 'd1', int(args[2]) if len(args) > 2 else 2,
-                        complexity=2 if 'heavy' in args[3:] else None)
+                        complexity=2 if 'heavy' in args[3:] else None, full=full)
     print('Saved', path)

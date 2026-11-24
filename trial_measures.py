@@ -52,7 +52,12 @@ EXCLUDED_FROM_SUMMARY = ['Familiarization']
 SUMMARY_PARTS = ['pre_test', 'pre_test_contralateral', 'practice', 'post_test', 'post_test_contralateral',
                  're_test', 're_test_contralateral']
 MEASURES = ['responsetime', 'movementtime', 'straighlinedeviation', 'numpeaks', 'AT', 'DT', 'AT_over_DT',
-            'endpointdistance']
+            'endpointdistance', 'responsetime_jason', 'movementtime_jason']
+# responsetime_jason / movementtime_jason: exactly as calculateMeasures.m - the onset is searched only from the light
+# on (so never negative), and when the speed never drops below 5% the onset is the light-on sample (RT ~ 0). For
+# comparing with the previous system; responsetime / movementtime are the app's (negative RT when anticipated).
+REPRESS_S = 0.4          # hand/foot on the switch this long before the light went off -> pressed again? (usual ~0.1 s)
+OUTLIER_MAD = 3.5        # RT / MT further than this many (scaled) MADs from its limb's median -> unusual
 
 
 SPIKE_FRACTION = 0.03            # a point > 3% of the image size away from its neighbours' median is a glitch
@@ -118,6 +123,7 @@ def calculate_measures(k, target_pos, home_pos=None):
     first = int(after[0])
     seg_tv = tv[s:first + 1]
     below = np.nonzero(seg_tv < 0.05 * maxtv)[0]
+    jason_onset = s + int(below[-1]) if len(below) else s         # calculateMeasures.m as it is
     if len(below):
         onset = s + int(below[-1])                                   # calculateMeasures.m
     else:                                                            # never < 5%: 5% above the resting level
@@ -147,7 +153,8 @@ def calculate_measures(k, target_pos, home_pos=None):
     m = dict(responsetime=time[onset] - stim, movementtime=time[end] - time[onset],
              straighlinedeviation=float(np.mean(_point_line_distance(seg, seg[0], seg[-1]))),
              numpeaks=len(find_peaks(tv[rng], height=0.1 * tv.max())[0]),
-             AT=time[first] - time[onset], DT=time[end] - time[first])
+             AT=time[first] - time[onset], DT=time[end] - time[first],
+             responsetime_jason=time[jason_onset] - stim, movementtime_jason=time[end] - time[jason_onset])
     m['AT_over_DT'] = m['AT'] / m['DT'] if m['DT'] > 0 else np.nan
     m['endpointdistance'] = float(np.linalg.norm(seg[-1] - target_pos)) if target_pos is not None else np.nan
     m.update(onset_s=time[onset], end_s=time[end], peak_s=time[first], start_pos=xyz[onset],
@@ -254,6 +261,60 @@ def measure_trials(trials, times_ms, sources):
         if r['Outcome'] == 'hit':
             r['corrected_from'] = corrected_reach(k, m, t_s[r['off_frame']], r['Target'], src['switch_pos'],
                                                   src['switch_size'])
+    review_trials(trials)
+    return trials
+
+
+def review_trials(trials):
+    """Flags for data cleaning (in place): Repress, Clean, and a recommendation ('exclude' / 'check' / '') with
+    its reasons. Nothing is left out automatically - touse stays as it was; the recommendation is for the user.
+      exclude: no press in time (miss), trial not found, no movement data, corrected (went to another switch)
+      check:   pressed again? (on the switch >= REPRESS_S before the light went off), not from home, RT or MT
+               unusual for that limb (> OUTLIER_MAD scaled MADs from its median)
+    Clean = a hit with movement data, not corrected, not pressed again, started from home."""
+    usual = {}
+    groups = {}
+    for r in trials:
+        if r['Outcome'] == 'hit' and r.get('Data'):
+            groups.setdefault((r['Limb'], r['Side']), []).append(r)
+    for key, rows in groups.items():
+        for m in ('responsetime', 'movementtime'):
+            x = np.array([r[m] for r in rows], float)
+            x = x[~np.isnan(x)]
+            if len(x) >= 10:
+                med = np.median(x)
+                usual[key + (m,)] = (med, max(1.4826 * np.median(np.abs(x - med)), 0.02))
+    for r in trials:
+        exclude, check = [], []
+        out = r['Outcome']
+        if out == 'miss':
+            exclude.append('miss: no press in time (the light went off by itself)')
+        elif out == 'not detected':
+            exclude.append('trial not found in the video')
+        elif out != 'hit':
+            exclude.append(f'outcome {out}')
+        elif not r.get('Data'):
+            exclude.append('no movement data (the hand/foot was not seen)')
+        if r.get('corrected_from'):
+            exclude.append(f"went to switch {r['corrected_from']} first, then corrected")
+        gap = None
+        if out == 'hit' and r.get('Touch_ms') is not None and r.get('Hit_ms') is not None:
+            gap = (r['Hit_ms'] - r['Touch_ms']) / 1000
+        r['touch_to_hit_s'] = gap
+        r['repress'] = gap is not None and gap >= REPRESS_S
+        if r['repress']:
+            check.append(f'on the switch {gap:.2f} s before the light went off - pressed again?')
+        if r.get('start_from') not in ('', 'home', None):
+            check.append(f"started from {r['start_from']}, not from home")
+        for m, name in (('responsetime', 'RT'), ('movementtime', 'MT')):
+            u = usual.get((r['Limb'], r['Side'], m))
+            v = r.get(m)
+            if u and v is not None and not np.isnan(v) and abs(v - u[0]) > OUTLIER_MAD * u[1]:
+                check.append(f'{name} {v:.3f} s is unusual for this limb (median {u[0]:.3f} s)')
+        r['Clean'] = (out == 'hit' and bool(r.get('Data')) and not r.get('corrected_from') and not r['repress']
+                      and r.get('start_from') in ('', 'home', None))
+        r['Recommendation'] = 'exclude' if exclude else 'check' if check else ''
+        r['Reasons'] = '; '.join(exclude + check)
     return trials
 
 
@@ -263,7 +324,8 @@ def measure_trials(trials, times_ms, sources):
 TRIAL_COLUMNS = ['Part', 'Block', 'Sequence', 'Trial', 'Target', 'Limb', 'Side', 'Light_on_ms', 'Touch_ms',
                  'Hit_ms', 'Light_off_ms', 'Trial_end_ms', 'Outcome', 'Light_source', 'Anticipation',
                  'Anticipation_ms', 'Not_from_home', 'Started_from', 'Start_distance_pct', 'Corrected',
-                 'Corrected_from', 'RT_s', 'MT_s']
+                 'Corrected_from', 'RT_s', 'MT_s', 'Repress', 'Touch_to_hit_s', 'Clean', 'Recommendation',
+                 'Reasons', 'RT_jason_s', 'MT_jason_s', 'touse', 'System_ms']
 
 
 def _cell(v):
@@ -295,7 +357,11 @@ def write_trials_csv(path, trials):
                         int(r.get('start_from') not in ('', 'home')), r.get('start_from', ''),
                         _cell(r.get('start_dist_pct')),
                         int(r.get('corrected_from') is not None), _cell(r.get('corrected_from')),
-                        _cell(r.get('responsetime')), _cell(r.get('movementtime'))])
+                        _cell(r.get('responsetime')), _cell(r.get('movementtime')),
+                        _cell(r.get('repress')), _cell(r.get('touch_to_hit_s')), _cell(r.get('Clean')),
+                        r.get('Recommendation', ''), r.get('Reasons', ''),
+                        _cell(r.get('responsetime_jason')), _cell(r.get('movementtime_jason')),
+                        _cell(r.get('touse')), _cell(r.get('System_ms'))])
 
 
 def _iqr(x):
@@ -341,7 +407,7 @@ def summary_tables(rows_by_subject):
 MEASURE_COLUMNS = (['Subject', 'Session', 'Part', 'Block', 'Sequence', 'Trial', 'Target', 'Outcome', 'Light_source',
                     'Anticipation',
                     'Anticipation_ms', 'Not_from_home', 'Started_from', 'Start_distance_pct', 'Corrected',
-                    'Corrected_from', 'Data'] + MEASURES + ['touse'])
+                    'Corrected_from', 'Repress', 'Clean', 'Recommendation', 'Reasons', 'Data'] + MEASURES + ['touse'])
 
 
 def measure_row(subject, session, r):
@@ -358,6 +424,8 @@ def measure_row(subject, session, r):
             'Not_from_home': r.get('start_from') not in ('', 'home', None), 'Started_from': r.get('start_from', ''),
             'Start_distance_pct': r.get('start_dist_pct'),
             'Corrected': r.get('corrected_from') is not None, 'Corrected_from': r.get('corrected_from'),
+            'Repress': bool(r.get('repress')), 'Clean': bool(r.get('Clean')),
+            'Recommendation': r.get('Recommendation', ''), 'Reasons': r.get('Reasons', ''),
             'Data': r.get('Data', ''),
             **{m: r.get(m, np.nan) for m in MEASURES}, 'touse': bool(r.get('touse'))}
 

@@ -219,6 +219,11 @@ class Session:
                                  st.get('parts_override'))
         if noisy_names:
             res['warnings'].append('Flickering light (used only inside blocks): ' + ', '.join(noisy_names) + '.')
+        system = st.get('system') or {}
+        if system.get('use') and system.get('sheets'):     # optional: the light-switch system's own times
+            import system_times
+            res['warnings'] += system_times.apply_system_times(res['trials'], system, self.times, self.fps,
+                                                               res.get('delay'), touch, settings_of(st))
         if len(self.cams) == 2:
             (a0, a1), (b0, b1) = self.coverage['a'], self.coverage['b']
             for name, (x0, x1), other in (('A', (a0, a1), (b0, b1)), ('B', (b0, b1), (a0, a1))):

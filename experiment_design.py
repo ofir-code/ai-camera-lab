@@ -35,7 +35,10 @@ class Settings:
     sequences_per_block: int = 5
     block_gap_s: float = 10.0        # a pause longer than this between two lights starts a new block
     light_window_s: float = 1.0      # the light stays on at most this long when the button is not hit
-    miss_margin_s: float = 0.06      # light on >= window - margin -> nobody pressed it (a miss)
+    # light on >= window - margin -> nobody pressed it (a miss). Negative: the video sees a light ~30-50 ms longer
+    # than it was on (it changes between frames) - checked against the light-switch system: a press just before the
+    # 1 s timeout measures up to ~1.00 s, a timeout ~1.04-1.06 s.
+    miss_margin_s: float = -0.03
     min_block_trials: int = 10       # shorter groups of lights (e.g. testing the lights) are ignored
     fill_hidden_lights: bool = True  # infer lights no camera saw from the 1 s timing between trials
     pattern: list = field(default_factory=list)   # the 6-switch order; empty = found from the data
