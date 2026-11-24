@@ -38,7 +38,9 @@ LIGHT_BOX_MARGIN = 0.25   # light is measured in the switch box enlarged by 25% 
 # Touching = a hand/foot point inside the switch box or within this fraction of the box size outside it.
 # The button sticks out on the subject's side, so fingertips pressing it can sit just outside the box.
 TOUCH_DIST = 0.25
-MIN_EVENT_S = 0.07        # light changes shorter than this are ignored (noise, arm passing through the beam)
+# Light changes shorter than this are ignored (noise). Kept short (2 frames at 50 fps): a subject who presses as the
+# light comes on lights it for only 2-3 frames; weak bumps (an arm passing) are still left out by the full-level test.
+MIN_EVENT_S = 0.03
 MERGE_GAP_S = 0.15        # a light hidden for less than this (hand/foot passing over the LED) is one event
 # A switch whose light level between events is above this fraction of its level during events is lit all
 # the time (blinking switches: <= 0.15, always-lit: >= 0.58); its "events" are only the hand passing by.

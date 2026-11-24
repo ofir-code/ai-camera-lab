@@ -92,10 +92,19 @@ class FindLightEvents(unittest.TestCase):
     def test_short_blips_and_gaps(self):
         pulses = [(200 + 150 * k, 240 + 150 * k) for k in range(10)]
         s = signal(pulses=pulses)
-        s[1000:1003] += 40                               # 3 frames (< 0.07 s): noise, not an event
+        s[1000] += 40                                    # 1 frame (< 0.03 s): a glitch, not an event
         s[200 + 150 * 3 + 15:200 + 150 * 3 + 19] -= 40   # a hand hides the LED for 4 frames: still one event
         ev, _ = ek.find_light_events(s, FPS)
         self.assertEqual(ev, pulses)
+
+    def test_very_short_flashes(self):
+        """A subject who presses as the light comes on lights it for only 2-3 frames (seen at 50 fps): still events."""
+        fps = 50.0
+        pulses = [(200 + 150 * k, 240 + 150 * k) for k in range(10)]
+        short = [(1720, 1722), (1870, 1873)]            # 2 and 3 frames (40 and 60 ms)
+        ev, why = ek.find_light_events(signal(n=3000, pulses=sorted(pulses + short)), fps)
+        self.assertEqual(why, '')
+        self.assertEqual(ev, sorted(pulses + short))
 
     def test_partly_hidden_still_on(self):
         """A light dimmed by the hand (above 20% of its level) counts as on; a weak bump alone isn't an event."""
