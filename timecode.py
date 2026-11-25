@@ -11,6 +11,11 @@ A timecode HH:MM:SS:FF (non-drop) or HH:MM:SS;FF (drop-frame) counts frames at t
 59.94 fps); it is turned into a frame number and then into seconds with the file's real frame rate, so a
 59.94 fps camera's clock is right.
 
+Which clock does the counter follow? With a whole frame rate (50, 25, 100 fps: Anti-Flicker 50 Hz) the frame
+counter and the clock agree, so the offset is exact. With 59.94 / 29.97 fps a non-drop timecode can be read two
+ways: frames of 1/59.94 s (the default here: frame counter -> seconds) or clock time (HH:MM:SS + FF/60). The two
+readings of an offset differ by 0.1 % (6 ms for a 6 s offset, 60 ms for 60 s) - so record at 50 fps.
+
 Reading: ffprobe (part of FFmpeg) if installed - the 'timecode' tag of the tmcd stream or of the file; else
 the timecode track is read straight from the MP4/MOV file (built-in, no FFmpeg needed).
 """
@@ -28,6 +33,9 @@ FFPROBE_HELP = ('ffprobe (FFmpeg) is not installed. On a Mac: install Homebrew (
 
 
 class TimecodeError(Exception):
+    """The error raised when a video's timecode can't be read or doesn't make sense
+    (the Lab App shows its message to the user).
+    """
     pass
 
 
@@ -62,6 +70,11 @@ def timecode_to_frames(tc, fps, drop_frame=None):
 
 
 def frames_to_timecode(n, fps, drop_frame=False):
+    """The opposite of timecode_to_frames: a frame number -> timecode text.
+
+    Inputs: n - frame number since 00:00:00:00; fps - frame rate; drop_frame - True for drop-frame timecode.
+    Returns: text like '13:05:42:17' (or '13:05:42;17' for drop-frame).
+    """
     rate = nominal_rate(fps)
     if drop_frame:
         k = round(rate / 15)
@@ -84,6 +97,12 @@ def timecode_seconds(tc, fps, drop_frame=None):
 # Reading a file's start timecode
 # -----------------------------
 def _ffprobe(path):
+    """Ask ffprobe (part of FFmpeg) to describe a video file.
+
+    Input: path - the video file.
+    Returns: ffprobe's description as a dict (streams, format, tags), or None if ffprobe is not installed.
+    Raises TimecodeError if ffprobe fails on the file.
+    """
     exe = shutil.which('ffprobe')
     if exe is None:
         return None
@@ -95,6 +114,11 @@ def _ffprobe(path):
 
 
 def _rate(text):
+    """A frame rate written as text -> a number.
+
+    Input: text - e.g. '60000/1001' or '50' (as ffprobe writes it).
+    Returns: the frame rate (e.g. 59.94), or None if it is missing or zero.
+    """
     if not text or text in ('0/0', '0'):
         return None
     if '/' in text:
@@ -135,6 +159,11 @@ def _boxes(f, start, end):
 
 
 def _child(f, start, end, typ):
+    """Find a box (section) of a given type inside an MP4 file region.
+
+    Inputs: f - the open file; start, end - the region to search (byte positions); typ - the box type, e.g. 'moov'.
+    Returns: (data start, box end) of the first such box, or None if there is none.
+    """
     return next(((s, e) for t, s, e in _boxes(f, start, end) if t == typ), None)
 
 
@@ -182,9 +211,11 @@ def read_tmcd(path):
     return None
 
 
-def start_timecode(path):
-    """dict(timecode, fps, seconds, source) for the file (its first chapter, for GoPro chapters)."""
-    path = vs.first_chapter(path)
+def start_timecode(path, chapter_only=False):
+    """dict(timecode, fps, seconds, source) for the file (its first chapter, for GoPro chapters - or, with
+    chapter_only, the start of that chapter itself)."""
+    if not chapter_only:
+        path = vs.first_chapter(path)
     info = None
     try:
         info = _ffprobe(path)
@@ -193,7 +224,8 @@ def start_timecode(path):
     if info is not None:
         tc, fps = parse_ffprobe(info)
         if tc and fps:
-            return dict(timecode=tc, fps=fps, seconds=timecode_seconds(tc, fps), source='ffprobe')
+            return dict(timecode=tc, fps=fps, seconds=timecode_seconds(tc, fps), source='ffprobe',
+                        frames=timecode_to_frames(tc, fps), drop=';' in tc or '.' in tc)
     import cv2
     cap = cv2.VideoCapture(path)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -205,7 +237,8 @@ def start_timecode(path):
     counter, tc_rate, drop = t
     tc = frames_to_timecode(counter, tc_rate, drop)
     # The counter counts frames at the timecode's rate; seconds with the video's real frame rate
-    return dict(timecode=tc, fps=fps or tc_rate, seconds=counter / (fps or tc_rate), source='file')
+    return dict(timecode=tc, fps=fps or tc_rate, seconds=counter / (fps or tc_rate), source='file',
+                frames=counter, drop=drop)
 
 
 def timecode_offset(path_a, path_b):
@@ -231,13 +264,21 @@ def chapter_gaps(path):
     src = vs.VideoSource(path, hardware=False)
     out = []
     try:
-        starts = [start_timecode(p)['seconds'] for p in paths]
+        starts = [start_timecode(p, chapter_only=True) for p in paths]
     except TimecodeError:
         return []   # no timecode: only the frame counts can be summed (done in VideoSource)
     for k in range(1, len(paths)):
-        expected = starts[k - 1] + src.info[k - 1]['duration_ms'] / 1000
-        gap = starts[k] - expected
-        if abs(gap) > 1.5 / src.info[k - 1]['fps']:
-            out.append(f'{os.path.basename(paths[k])} starts {gap * 1000:+.0f} ms after the end of the previous chapter'
-                       ' - the chapters are not continuous.')
+        prev = src.info[k - 1]
+        fps = prev['fps']
+        # In timecode frames, chapter k should start where chapter k-1 ends. The timecode counts either the
+        # frames themselves or the clock (frames x 60/59.94 at 59.94 fps): continuous if either one fits.
+        step = starts[k]['frames'] - starts[k - 1]['frames']
+        day = 24 * 3600 * nominal_rate(fps)
+        if step < -day / 2:           # the clip ran across midnight
+            step += day
+        expected = [prev['frames'], prev['frames'] * nominal_rate(fps) / fps]
+        gap = min((step - e for e in expected), key=abs)
+        if abs(gap) > 1.5:
+            out.append(f'{os.path.basename(paths[k])} starts {gap / fps * 1000:+.0f} ms after the end of the previous'
+                       ' chapter - the chapters are not continuous.')
     return out

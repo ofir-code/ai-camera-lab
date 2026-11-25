@@ -1,56 +1,28 @@
-"""Find where two cameras are relative to each other (and their lens settings), for analyze_two_views.py.
+"""Where two cameras are relative to each other (and their lens settings), for 3D in the Lab App.
 
-Two ways:
+The calibration itself runs in the Lab App (step 2, Calibration: the ChArUco board filmed by both cameras at the start
+of the session, or in separate clips). This file holds the maths, and prints the calibration board:
 
-  board  (best; for a fixed setup such as two GoPros on mounts)
-      1. Print the board once:   venv/bin/python calibrate_cameras.py make-board
-         (outputs/charuco_board.png; print at 100% scale on A4, glue it to something flat, and measure one
-         black square - it should be 38 mm).
-      2. At the start of a session, with both cameras recording, hold the board where both cameras see it and
-         slowly turn/tilt it and move it around the area where the subject will be, for ~20 s.
-      3. venv/bin/python calibrate_cameras.py board VIDEO_A VIDEO_B [--square-mm 38]
-      Gives each camera's focal length and lens distortion, the cameras' positions, and real units (cm).
-      If the cameras are not moved, one calibration serves every recording of that session.
-      (GoPro: use the "Linear" lens setting.)
-
-  clicks (for existing videos without a board, e.g. two phones)
-      venv/bin/python calibrate_cameras.py clicks VIDEO_A VIDEO_B [--focal-35mm 28]
-      The first frames of both videos open side by side. Click the same fixed point in A, then in B
-      (switch buttons, table corners, monitor corners...). The videos are in sync, so points on the subject in
-      that first frame count too (knuckle, ring, elbow tip, ear) - use them: points that are not all on the
-      table top give a much better result. At least 8 points, spread over the scene. Units are relative (distance between the cameras = 1)
-      unless you give a known distance: --known 1 5 52.0 = points 1 and 5 are 52.0 cm apart.
-
-The videos must be in sync (sync_videos.py). Output: outputs/<A>+<B>_cameras.json
+    venv/bin/python calibrate_cameras.py make-board
+    (outputs/charuco_board.pdf and .png; print the PDF at 100% / actual size on A4, glue it to something flat,
+    and measure one black square - it should be 38 mm).
 """
 import argparse
 import json
 import os
-import sys
 
 import cv2
 import numpy as np
-from scipy.optimize import least_squares
 
 import video_source as vs
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'outputs')
-WINDOW = 'Camera calibration'
 
 # ChArUco board: 5 x 7 squares of 38 mm on A4 (190 x 266 mm), 4x4 ArUco markers
 BOARD_SQUARES = (5, 7)
 BOARD_SQUARE_MM = 38.0
 BOARD_MARKER_RATIO = 0.75
 BOARD_DICT = cv2.aruco.DICT_4X4_50
-
-
-def pair_name(video_a, video_b):
-    names = [os.path.splitext(os.path.basename(p))[0].replace('_synced', '') for p in (video_a, video_b)]
-    return f'{names[0]}+{names[1]}'
-
-
-def cameras_path(video_a, video_b):
-    return os.path.join(OUT_DIR, f'{pair_name(video_a, video_b)}_cameras.json')
 
 
 def save_cameras(path, cam_a, cam_b, R, t, units, method, extra=None):
@@ -69,6 +41,13 @@ def save_cameras(path, cam_a, cam_b, R, t, units, method, extra=None):
 
 
 def load_cameras(path):
+    """Read a calibration file that save_cameras() wrote.
+
+    Input: path - the calibration .json file.
+    Returns: (cameras, units) - a list of the two cameras, each a dict with K (the lens: focal length and
+    image centre), dist (lens distortion), R and t (where the camera is; camera A is the reference, so it gets
+    "no rotation, no shift"), size (image width, height) - and the length units of t (e.g. 'cm').
+    """
     with open(path) as f:
         d = json.load(f)
     a, b = d['camera_a'], d['camera_b']
@@ -77,136 +56,25 @@ def load_cameras(path):
     return cams, d['units']
 
 
-def first_frame(path):
-    cap = vs.VideoSource(path, hardware=False)
-    ok, frame = cap.read()
-    cap.release()
-    if not ok:
-        sys.exit(f'Could not read {path}')
-    return frame
-
-
 def K_matrix(f, size):
+    """The camera's "lens matrix" (K) for a simple lens: focal length f in pixels, image centre in the middle.
+
+    Inputs: f - focal length (pixels); size - image (width, height) in pixels.
+    Returns: a 3 x 3 numpy array.
+    """
     return np.array([[f, 0, size[0] / 2], [0, f, size[1] / 2], [0, 0, 1]], float)
 
 
 # -----------------------------
 # Clicks
 # -----------------------------
-def click_points(img_a, img_b, screen=(1500, 900), start=None):
-    """Show both frames side by side; the user clicks matching points (A then B). Returns two (n, 2) arrays.
-    `start`: point pairs already clicked (shown, can be undone, new ones are added after them)."""
-    h = max(img_a.shape[0], img_b.shape[0])
-    scale = min(screen[0] / (img_a.shape[1] + img_b.shape[1]), screen[1] / h)
-    da = cv2.resize(img_a, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    db = cv2.resize(img_b, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    off_b = da.shape[1]
-    canvas0 = np.zeros((max(da.shape[0], db.shape[0]), da.shape[1] + db.shape[1], 3), np.uint8)
-    canvas0[:da.shape[0], :off_b] = da
-    canvas0[:db.shape[0], off_b:] = db
-    pts = {'a': [], 'b': []}
-    if start is not None:
-        pts = {'a': [tuple(p) for p in start[0]], 'b': [tuple(p) for p in start[1]]}
-    mouse = [0, 0]
-
-    def full_res(x, y):
-        """Display position -> (view, full-resolution point) or None."""
-        if x < off_b and y < da.shape[0]:
-            return 'a', (x / scale, y / scale)
-        if x >= off_b and y < db.shape[0]:
-            return 'b', ((x - off_b) / scale, y / scale)
-        return None
-
-    def on_mouse(event, x, y, flags, param):
-        mouse[:] = [x, y]
-        if event == cv2.EVENT_LBUTTONDOWN:
-            hit = full_res(x, y)
-            want = 'a' if len(pts['a']) == len(pts['b']) else 'b'
-            if hit and hit[0] == want:
-                pts[want].append(hit[1])
-
-    cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback(WINDOW, on_mouse)
-    while True:
-        canvas = canvas0.copy()
-        for view, off in (('a', 0), ('b', off_b)):
-            for i, (x, y) in enumerate(pts[view]):
-                p = (int(x * scale) + off, int(y * scale))
-                cv2.drawMarker(canvas, p, (0, 255, 255), cv2.MARKER_CROSS, 16, 2)
-                cv2.putText(canvas, str(i + 1), (p[0] + 6, p[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
-                cv2.putText(canvas, str(i + 1), (p[0] + 6, p[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        # Magnifier: 4x of the full-resolution image around the mouse, in the bottom corner of the canvas
-        hit = full_res(*mouse)
-        if hit:
-            img = img_a if hit[0] == 'a' else img_b
-            cx, cy = int(hit[1][0]), int(hit[1][1])
-            r = 40
-            patch = cv2.copyMakeBorder(img, r, r, r, r, cv2.BORDER_CONSTANT)[cy:cy + 2 * r, cx:cx + 2 * r]
-            zoom = cv2.resize(patch, (8 * r, 8 * r), interpolation=cv2.INTER_NEAREST)
-            cv2.drawMarker(zoom, (4 * r, 4 * r), (0, 0, 255), cv2.MARKER_CROSS, 30, 1)
-            zh, zw = zoom.shape[:2]
-            x0 = canvas.shape[1] - zw if hit[0] == 'a' else 0  # opposite side, so it doesn't hide the target
-            canvas[canvas.shape[0] - zh:, x0:x0 + zw] = zoom
-        n = len(pts['b'])
-        want = 'A (left)' if len(pts['a']) == len(pts['b']) else 'B (right)'
-        lines = [f'Point {len(pts["a"]) + (want[0] == "A")}: click it in {want}.   {n} pairs so far (need 8+).',
-                 'Switch buttons, table corners... and the subject at this moment (knuckle, ring, elbow) - not all on the table.',
-                 'U = undo   ENTER = done   C = cancel']
-        for i, line in enumerate(lines):
-            cv2.putText(canvas, line, (10, 25 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
-            cv2.putText(canvas, line, (10, 25 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.imshow(WINDOW, canvas)
-        key = cv2.waitKey(20) & 0xFF
-        if key in (ord('u'), ord('U')):
-            if len(pts['a']) > len(pts['b']):
-                pts['a'].pop()
-            elif pts['b']:
-                pts['b'].pop()
-        elif key in (13, 10) and n >= 8 and len(pts['a']) == n:
-            break
-        elif key in (ord('c'), ord('C'), 27):
-            cv2.destroyAllWindows()
-            return None, None
-    cv2.destroyAllWindows()
-    return np.array(pts['a'], float), np.array(pts['b'], float)
-
-
-def calibrate_from_points(pa, pb, size_a, size_b, f_a, f_b, refine_focal=None):
-    """Relative pose (R, t with |t| = 1) and focal lengths from matched points, plus the 3D points and
-    the reprojection errors (px)."""
-    n = len(pa)
-    if refine_focal is None:
-        refine_focal = n >= 20
-    na = (pa - np.array(size_a) / 2) / f_a
-    nb = (pb - np.array(size_b) / 2) / f_b
-    E, mask = cv2.findEssentialMat(na, nb, np.eye(3), method=cv2.LMEDS)
-    best = None
-    for Ei in E.reshape(-1, 3, 3):  # the 5-point method can return several solutions
-        good, R, t, _ = cv2.recoverPose(Ei, na, nb, np.eye(3))
-        if best is None or good > best[0]:
-            best = (good, R, t.ravel())
-    _, R, t = best
-
-    def unpack(p):  # one focal scale shared by both cameras (similar lenses): steadier with few points
-        fa, fb = (f_a * p[0], f_b * p[0]) if refine_focal else (f_a, f_b)
-        q = p[1:] if refine_focal else p
-        return fa, fb, cv2.Rodrigues(q[:3])[0], q[3:6] / np.linalg.norm(q[3:6]), q[6:].reshape(n, 3)
-
-    def residuals(p):
-        fa, fb, Rb, tb, X = unpack(p)
-        ra = project(X, K_matrix(fa, size_a), np.zeros(5), np.eye(3), np.zeros(3)) - pa
-        rb = project(X, K_matrix(fb, size_b), np.zeros(5), Rb, tb) - pb
-        return np.concatenate([ra.ravel(), rb.ravel()])
-
-    X0 = triangulate_px(pa, pb, K_matrix(f_a, size_a), K_matrix(f_b, size_b), R, t)
-    p0 = np.concatenate([[1.0] if refine_focal else [], cv2.Rodrigues(R)[0].ravel(), t, X0.ravel()])
-    res = least_squares(residuals, p0, x_scale='jac', loss='soft_l1', f_scale=5.0)
-    fa, fb, R, t, X = unpack(res.x)
-    err = np.hypot(*res.fun.reshape(2, n, 2).transpose(2, 0, 1)).max(axis=0)
-    return fa, fb, R, t, X, err
-
-
 def project(X, K, dist, R, t):
+    """Where 3D points appear in a camera's picture.
+
+    Inputs: X - 3D points (N x 3); K - the camera's lens matrix; dist - lens distortion; R, t - the camera's
+    rotation and position.
+    Returns: pixel positions, an N x 2 array (x, y).
+    """
     p, _ = cv2.projectPoints(np.asarray(X, np.float64).reshape(-1, 1, 3), cv2.Rodrigues(R)[0], np.asarray(t, float),
                              K, np.asarray(dist, float))
     return p.reshape(-1, 2)
@@ -221,61 +89,43 @@ def triangulate_px(pa, pb, Ka, Kb, R, t, dist_a=np.zeros(5), dist_b=np.zeros(5))
     return (X[:3] / X[3]).T
 
 
-def run_clicks(args):
-    img_a, img_b = first_frame(args.video_a), first_frame(args.video_b)
-    size_a, size_b = (img_a.shape[1], img_a.shape[0]), (img_b.shape[1], img_b.shape[0])
-    clicks_file = os.path.join(OUT_DIR, f'{pair_name(args.video_a, args.video_b)}_clicks.json')
-    saved = None
-    if os.path.exists(clicks_file) and not args.again:
-        with open(clicks_file) as f:
-            c = json.load(f)
-        saved = np.array(c['a']), np.array(c['b'])
-    if args.drop and saved is not None:
-        keep = [i for i in range(len(saved[0])) if i + 1 not in args.drop]
-        saved = saved[0][keep], saved[1][keep]
-        print(f'Dropped point(s) {", ".join(map(str, args.drop))}; the rest are renumbered 1-{len(keep)}.')
-    if saved is not None and not args.edit:
-        pa, pb = saved
-        print(f'Using the {len(pa)} saved point pairs in {clicks_file} '
-              f'(--edit to add/remove points, --again to start over).')
-    else:
-        pa, pb = click_points(img_a, img_b, start=saved)
-        if pa is None:
-            sys.exit('Cancelled.')
-    if args.drop or args.edit or saved is None:
-        os.makedirs(OUT_DIR, exist_ok=True)
-        with open(clicks_file, 'w') as f:
-            json.dump(dict(a=pa.round(1).tolist(), b=pb.round(1).tolist()), f, indent=1)
-    f_a = max(size_a) * args.focal_35mm / 36
-    f_b = max(size_b) * args.focal_35mm / 36
-    fa, fb, R, t, X, err = calibrate_from_points(pa, pb, size_a, size_b, f_a, f_b)
-    print(f'{len(pa)} point pairs: focal A {fa:.0f} px, focal B {fb:.0f} px, '
-          f'reprojection error median {np.median(err):.1f} px, max {err.max():.1f} px (point {np.argmax(err) + 1})')
-    print('  error per point (px): ' + '  '.join(f'{i + 1}: {e:.0f}' for i, e in enumerate(err)))
-    if err.max() > 15:
-        print(f'WARNING: some points fit badly - check that each pair was clicked on the same spot '
-              f'(e.g. --drop {np.argmax(err) + 1}, or --edit).')
-    # Flatness check: all points close to one plane makes the result unreliable
-    sv = np.linalg.svd(X - X.mean(axis=0), compute_uv=False)
-    if sv[2] / sv[0] < 0.05:
-        print('WARNING: the points are almost on one plane - add points off the table (monitor, socket, wall).')
-    units, scale = 'relative (distance between the cameras = 1)', 1.0
-    if args.known:
-        i, j, cm = int(args.known[0]) - 1, int(args.known[1]) - 1, float(args.known[2])
-        scale = cm / np.linalg.norm(X[i] - X[j])
-        units = 'cm'
-        print(f'Scale: points {i + 1}-{j + 1} = {cm} cm -> cameras are {scale:.1f} cm apart')
-    save_cameras(cameras_path(args.video_a, args.video_b),
-                 dict(K=K_matrix(fa, size_a), dist=np.zeros(5), size=size_a),
-                 dict(K=K_matrix(fb, size_b), dist=np.zeros(5), size=size_b),
-                 R, t * scale, units, 'clicks',
-                 dict(points=len(pa), reprojection_px_median=round(float(np.median(err)), 2)))
+AGREE_FRACTION = 0.0065     # both views' points meet in 3D within this x the image size (25 px at 4K)
+DISAGREE_FACTOR = 4.0       # confident points this many times further apart: one view is wrong (e.g. another person)
+
+
+def track_3d(pa, pb, raw_a, raw_b, ca, cb):
+    """3D marker track from two cameras. pa / pb: the points MediaPipe is sure of (NaN otherwise); raw_a / raw_b:
+    all its points, sure or not. A moment is used when both views are sure (unless their points clearly don't
+    meet in 3D - one view is on something else), or when both views' points meet in 3D even though MediaPipe was
+    unsure (an unusual pose, e.g. a leg on the table, lowers its confidence without moving the point).
+    Returns (X: frames x 3, NaN where not used; how: array of '' / 'sure' / 'agree')."""
+    n = len(pa)
+    X = np.full((n, 3), np.nan)
+    how = np.full(n, '', dtype=object)
+    ok = ~np.isnan(raw_a[:, 0]) & ~np.isnan(raw_b[:, 0])
+    if not ok.any():
+        return X, how
+    Xr = triangulate_px(raw_a[ok], raw_b[ok], ca['K'], cb['K'], cb['R'], cb['t'], ca['dist'], cb['dist'])
+    err = np.maximum(np.linalg.norm(project(Xr, ca['K'], ca['dist'], np.eye(3), np.zeros(3)) - raw_a[ok], axis=1),
+                     np.linalg.norm(project(Xr, cb['K'], cb['dist'], cb['R'], cb['t']) - raw_b[ok], axis=1))
+    tol = AGREE_FRACTION * max(max(ca['size']), max(cb['size']))
+    sure = (~np.isnan(pa[:, 0]) & ~np.isnan(pb[:, 0]))[ok]
+    use = (sure & (err < DISAGREE_FACTOR * tol)) | (err < tol)
+    idx = np.nonzero(ok)[0]
+    X[idx[use]] = Xr[use]
+    how[idx[use & sure]] = 'sure'
+    how[idx[use & ~sure]] = 'agree'
+    return X, how
 
 
 # -----------------------------
 # Board
 # -----------------------------
 def make_board():
+    """Create the ChArUco calibration board (black squares with small coded markers) and its detector.
+
+    Returns: (board, detector) - the board's description, and an OpenCV object that finds the board in a frame.
+    """
     dictionary = cv2.aruco.getPredefinedDictionary(BOARD_DICT)
     board = cv2.aruco.CharucoBoard(BOARD_SQUARES, BOARD_SQUARE_MM, BOARD_SQUARE_MM * BOARD_MARKER_RATIO, dictionary)
     return board, cv2.aruco.CharucoDetector(board)
@@ -294,11 +144,21 @@ def _layout():
 
 
 def board_image(px_per_square):
+    """A picture of the board alone (no page margins), for printing.
+
+    Input: px_per_square - how many pixels each square gets.
+    Returns: a black-and-white image (numpy array).
+    """
     board, _ = make_board()
     return board.generateImage((BOARD_SQUARES[0] * px_per_square, BOARD_SQUARES[1] * px_per_square), marginSize=0)
 
 
 def write_board_png(path, dpi=300):
+    """Save the printable A4 page (board + "print at 100%" text + 100 mm check bar) as a PNG image.
+
+    Inputs: path - where to save; dpi - pixels per inch (300 = good print quality).
+    Returns: nothing (writes the file).
+    """
     px = dpi / 25.4
     lay = _layout()
     page = np.full((int(round(A4_MM[1] * px)), int(round(A4_MM[0] * px))), 255, np.uint8)
@@ -364,6 +224,10 @@ def write_board_pdf(path, px_per_mm=20):
 
 
 def run_make_board(args):
+    """The "make-board" command: save the printable board as PDF and PNG in the outputs folder.
+
+    Input: args - the command-line arguments (not used). Returns: nothing (writes 2 files, prints their paths).
+    """
     os.makedirs(OUT_DIR, exist_ok=True)
     png, pdf = os.path.join(OUT_DIR, 'charuco_board.png'), os.path.join(OUT_DIR, 'charuco_board.pdf')
     write_board_png(png)
@@ -371,7 +235,27 @@ def run_make_board(args):
     print(f'Saved: {pdf} (A4, exact scale - print at 100% / Actual size)\n       {png} (A4, 300 dpi)')
 
 
+def make_sensitive_detector(board):
+    """A board detector that also finds a small board seen at a steep angle (a camera far away / from the side)."""
+    params = cv2.aruco.DetectorParameters()
+    params.adaptiveThreshWinSizeMax = 53
+    params.minMarkerPerimeterRate = 0.005
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    cp = cv2.aruco.CharucoParameters()
+    cp.tryRefineMarkers = True
+    return cv2.aruco.CharucoDetector(board, cp, params)
+
+
+STATIC_BOARD_PX = 30.0     # the board moved less than this (median corner, px) -> it lay still: one position only
+
+
 def detect_board(detector, frame, min_corners=6):
+    """Look for the calibration board in one video frame.
+
+    Inputs: detector - from make_board(); frame - a color video frame; min_corners - how many board corners
+    must be seen to count it as found.
+    Returns: (corner pixel positions, corner id numbers), or None if the board was not found.
+    """
     corners, ids, _, _ = detector.detectBoard(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
     if ids is None or len(ids) < min_corners:
         return None
@@ -382,10 +266,16 @@ class _Sequential:
     """Reads a video forward and hands out the frame closest to a time (ms on the video's own clock)."""
 
     def __init__(self, src, fps):
+        """Inputs: src - an open video; fps - its frames per second (used to know how close "closest" must be)."""
         self.src, self.half = src, 500.0 / fps
         self.t, self.done = None, False
 
     def at(self, target_ms):
+        """The frame shown at a given moment, reading forward only (fast; it never jumps back).
+
+        Input: target_ms - the moment, in milliseconds on this video's clock.
+        Returns: the frame (image), or None if the video has no frame at that moment.
+        """
         while not self.done and (self.t is None or self.t < target_ms - self.half):
             if not self.src.grab():
                 self.done = True
@@ -424,11 +314,12 @@ def _grid_neighbors(ids):
 
 
 def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, start_s=0.0, seconds=60.0,
-                    per_second=4.0, progress=None, should_stop=None):
+                    per_second=4.0, progress=None, should_stop=None, lenses=None):
     """Board calibration of two cameras. Returns a dict with the cameras (K, dist, size, R, t in cm), the
     numbers of frames with the board, the fit errors, the check (reconstructed square size, reprojection
     error) and warnings."""
     board, detector = make_board()
+    sensitive = make_sensitive_detector(board)
     scale = square_mm / BOARD_SQUARE_MM          # the board's object points at the measured size (mm)
     board_xyz = board.getChessboardCorners().reshape(-1, 3) * scale
     srcs = [vs.VideoSource(video_a, hardware=True), vs.VideoSource(video_b, hardware=True)]
@@ -450,31 +341,54 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
             if frame is None:
                 continue
             small = cv2.resize(frame, None, fx=0.5, fy=0.5) if max(sizes[v]) > 2000 else frame
-            if detect_board(detector, small) is not None:     # quick check at half size first
-                d = detect_board(detector, frame)
-                if d is not None:
-                    seen[v][k] = d
+            d = detect_board(detector, frame) if detect_board(detector, small) is not None else None
+            if d is None:                                      # small / steep board: full size, sensitive detector
+                d = detect_board(sensitive, frame)
+            if d is not None:
+                seen[v][k] = d
         if progress and k % 4 == 0:
             progress((k + 1) / len(times), f'board seen in {len(seen[0])} (A) / {len(seen[1])} (B) frames')
         if should_stop and should_stop():
             break
     for s in srcs:
         s.release()
+    # Views whose corners lie (nearly) on one line - an edge-on board, or one row of corners - can't tell a
+    # lens (OpenCV fails on them): leave them out
+    for v in range(2):
+        seen[v] = {k: d for k, d in seen[v].items() if _spread_view(board_xyz[d[1]])}
     for v in range(2):
         if len(seen[v]) < 10:
             raise ValueError(f'The board was found in only {len(seen[v])} frames of video {"AB"[v]} - need 10+ '
                              '(is it in view in that time window? is the offset right?).')
 
-    # Each camera's lens (focal length, distortion) from its own board views (up to 60, spread over time)
-    cams, lens_rms = [], []
-    for v in range(2):
+    # Did the board move? If it lay still (e.g. on the table), each camera saw it in one position only - that
+    # can't tell a camera's lens: then one lens model shared by both cameras (same model and settings)
+    both = set(seen[0]) & set(seen[1])                 # the moments both cameras saw it
+    moved = [_board_movement({k: seen[v][k] for k in both}) for v in range(2)]
+    if lenses is None and len(both) >= 3 and max(moved) < STATIC_BOARD_PX:
+        return _calibrate_static_board([{k: seen[v][k] for k in both} for v in range(2)], board_xyz, sizes,
+                                       offset_s, times, square_mm, moved, warnings)
+
+    # Each camera's lens (focal length, distortion) from its own board views (up to 60, spread over time); views
+    # that fit far worse than the rest (a wrong detection, a blurred board) are dropped and the fit redone
+    cams, lens_rms, dropped = [], [], 0
+    for v in range(2 if lenses is None else 0):
         keys = sorted(seen[v])
-        views = [seen[v][k] for k in keys[::max(1, len(keys) // 60)]]
-        obj = [board_xyz[ids].astype(np.float32) for _, ids in views]
-        img = [c.astype(np.float32) for c, _ in views]
-        rms, K, dist, _, _ = cv2.calibrateCamera(obj, img, sizes[v], None, None, flags=cv2.CALIB_FIX_K3)
+        keys = keys[::max(1, len(keys) // 60)]
+        obj = [board_xyz[seen[v][k][1]].astype(np.float32) for k in keys]
+        img = [seen[v][k][0].astype(np.float32) for k in keys]
+        rms, K, dist, bad = _robust_fit(lambda o, i: cv2.calibrateCameraExtended(
+            o, i, sizes[v], None, None, flags=cv2.CALIB_FIX_K3), obj, img)
+        for i in bad:                      # not used for the stereo step either
+            seen[v].pop(keys[i], None)
+        dropped += len(bad)
         cams.append(dict(K=K, dist=dist, size=sizes[v]))
         lens_rms.append(float(rms))
+    if lenses is not None:        # each camera's lens from an earlier calibration of the same camera
+        for v in range(2):
+            cams.append(dict(K=np.asarray(lenses[v]['K'], float), dist=np.asarray(lenses[v]['dist'], float).reshape(-1, 1),
+                             size=sizes[v]))
+            lens_rms.append(float('nan'))
 
     # Where camera B is: the moments both cameras saw the board (the same corners in both)
     obj_s, img_a, img_b, common_ids = [], [], [], []
@@ -490,10 +404,19 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
     if len(obj_s) < 5:
         raise ValueError(f'Both cameras saw the board at the same moment in only {len(obj_s)} frames - need 5+ '
                          '(hold it where both cameras see it; check the offset).')
-    rms, _, _, _, _, R, t, _, _ = cv2.stereoCalibrate(obj_s, img_a, img_b, cams[0]['K'], cams[0]['dist'],
-                                                     cams[1]['K'], cams[1]['dist'], sizes[0],
-                                                     flags=cv2.CALIB_FIX_INTRINSIC)
-    t = t.ravel()
+    def stereo(o, ia, ib):
+        r = cv2.stereoCalibrateExtended(o, ia, ib, cams[0]['K'], cams[0]['dist'], cams[1]['K'], cams[1]['dist'],
+                                        sizes[0], np.eye(3), np.zeros((3, 1)), flags=cv2.CALIB_FIX_INTRINSIC)
+        return r[0], r[5], r[6], r[-1].max(axis=1)      # rms, R, t, per pair: the worse of the two views
+    rms, R, t, bad = _robust_fit(lambda o, ab: stereo(o, [x[0] for x in ab], [x[1] for x in ab]), obj_s,
+                                 list(zip(img_a, img_b)), errors_last=True)
+    for i in sorted(bad, reverse=True):
+        del obj_s[i], img_a[i], img_b[i], common_ids[i]
+    dropped += len(bad)
+    if not np.isfinite(rms) or not np.all(np.isfinite(t)):
+        raise ValueError('The two cameras could not be placed from the board views (the fit did not converge) - '
+                         'film the board again: slowly, whole in both cameras, at a few tilts.')
+    t = np.asarray(t).ravel()
 
     # Check: triangulate the corners and measure the squares
     sq, reproj = [], []
@@ -515,29 +438,136 @@ def calibrate_board(video_a, video_b, offset_s=0.0, square_mm=BOARD_SQUARE_MM, s
     if res['stereo_rms_px'] > 1.0:
         warnings.append(f"Stereo fit error {res['stereo_rms_px']:.2f} px (> 1 px) - check the offset (wrong pairing "
                         'of frames) and that the board is flat.')
+    if lenses is not None:
+        res['lens_from'] = [l.get('source', '') for l in lenses]
     for v in range(2):
         if lens_rms[v] > 1.0:
             warnings.append(f'Camera {"AB"[v]} lens fit error {lens_rms[v]:.2f} px (> 1 px).')
     if abs(res['square_mean_mm'] - square_mm) > 0.02 * square_mm:
         warnings.append(f"The squares come out {res['square_mean_mm']:.1f} mm instead of {square_mm:.1f} mm.")
+    if dropped:
+        res['views_dropped'] = dropped
     res['warnings'] = warnings
     res['ok'] = not warnings
+    res['method'] = 'board (moving)' if lenses is None else 'board, lenses from an earlier calibration'
     return res
 
 
+def _robust_fit(fit, obj, img, rounds=3, errors_last=False):
+    """Run an OpenCV calibration `fit(obj, img)` (calibrateCameraExtended-style: rms first, per-view errors last),
+    dropping views whose error is far above the others' (> 3 x the median and > 2 px) and fitting again.
+    Returns (rms, first result, second result, indices of the dropped views) - for calibrateCameraExtended
+    (rms, K, dist, dropped); with errors_last the fit returns (rms, a, b, per-view errors)."""
+    keep = list(range(len(obj)))
+    for _ in range(rounds):
+        r = fit([obj[i] for i in keep], [img[i] for i in keep])
+        errs = np.asarray(r[3] if errors_last else r[-1]).ravel()
+        a, b = (r[1], r[2])
+        lim = max(3 * float(np.median(errs)), 2.0)
+        bad = errs > lim
+        if not bad.any() or len(keep) - bad.sum() < 5:
+            break
+        keep = [k for k, x in zip(keep, bad) if not x]
+    dropped = sorted(set(range(len(obj))) - set(keep))
+    return r[0], a, b, dropped
+
+
+def _spread_view(xyz, min_ratio=0.15):
+    """True if the board corners seen are spread over an area, not (nearly) along one line."""
+    if len(xyz) < 6:
+        return False
+    sv = np.linalg.svd(xyz[:, :2] - xyz[:, :2].mean(axis=0), compute_uv=False)
+    return sv[0] > 0 and sv[1] / sv[0] > min_ratio
+
+
+def _board_movement(seen):
+    """How far the board moved over the views (median over corners of the largest corner displacement, px)."""
+    pos = {}
+    for c, ids in seen.values():
+        for p, i in zip(c, ids):
+            pos.setdefault(int(i), []).append(p)
+    spans = [np.ptp(np.array(v), axis=0).max() for v in pos.values() if len(v) >= 3]
+    return float(np.median(spans)) if spans else 0.0
+
+
+def _calibrate_static_board(seen, board_xyz, sizes, offset_s, times, square_mm, moved, warnings):
+    """The board lay still: each camera's board position from the median of its views, one lens shared by both
+    cameras (focal length fitted, image centre, no distortion - GoPro Linear lens), and from the two board
+    positions where camera B is. Less exact than a moving board."""
+    obj, img, ids_v = [], [], []
+    for v in range(2):
+        pos = {}
+        for c, ids in seen[v].values():
+            for p, i in zip(c, ids):
+                pos.setdefault(int(i), []).append(p)
+        need = max(3, len(seen[v]) // 2)
+        ids = sorted(i for i, p in pos.items() if len(p) >= need)
+        if len(ids) < 6:
+            raise ValueError(f'The board was seen too rarely in video {"AB"[v]} to calibrate.')
+        obj.append(board_xyz[ids].astype(np.float32))
+        img.append(np.float32([np.median(pos[i], axis=0) for i in ids]))
+        ids_v.append(ids)
+    flags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT | cv2.CALIB_FIX_ASPECT_RATIO |
+             cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3)
+    K0 = K_matrix(0.53 * max(sizes[0]), sizes[0])                # ~ GoPro Linear 4K
+    rms, K, _, rv, tv = cv2.calibrateCamera(obj, img, sizes[0], K0, np.zeros(5), flags=flags)
+    Ra, Rb = cv2.Rodrigues(rv[0])[0], cv2.Rodrigues(rv[1])[0]
+    ta, tb = tv[0].ravel(), tv[1].ravel()
+    R, t = Rb @ Ra.T, tb - Rb @ Ra.T @ ta
+    lens_rms = []
+    for v, (Rv, tvv) in enumerate(((Ra, ta), (Rb, tb))):
+        e = np.linalg.norm(project(obj[v], K, np.zeros(5), Rv, tvv) - img[v], axis=1)
+        lens_rms.append(float(np.sqrt(np.mean(e ** 2))))
+    common = sorted(set(ids_v[0]) & set(ids_v[1]))
+    pa = np.float32([img[0][ids_v[0].index(i)] for i in common])
+    pb = np.float32([img[1][ids_v[1].index(i)] for i in common])
+    X = triangulate_px(pa, pb, K, K, R, t)
+    pos = dict(zip(common, X))
+    sq = np.array([np.linalg.norm(pos[i] - pos[j]) for i, j in _grid_neighbors(common)])
+    reproj = np.concatenate([np.linalg.norm(project(X, K, np.zeros(5), np.eye(3), np.zeros(3)) - pa, axis=1),
+                             np.linalg.norm(project(X, K, np.zeros(5), R, t) - pb, axis=1)])
+    cams = [dict(K=K, dist=np.zeros(5), size=sizes[0]), dict(K=K, dist=np.zeros(5), size=sizes[1])]
+    warnings = warnings + [
+        f'The board lay still while both cameras saw it ({len(seen[0])} moments, it moved {max(moved):.0f} px at '
+        'most), so they saw it in one position only: one lens model shared by both cameras is assumed. 3D is less '
+        'exact - next time hold the board and slowly tilt and move it for 20-30 s where both cameras see it.']
+    return dict(cameras=cams, R=R, t_cm=t / 10, frames_a=len(seen[0]), frames_b=len(seen[1]),
+                frames_both=len(set(seen[0]) & set(seen[1])), lens_rms_px=lens_rms, stereo_rms_px=float(rms),
+                distance_cm=float(np.linalg.norm(t) / 10), square_mm=float(square_mm),
+                square_mean_mm=float(sq.mean()), square_sd_mm=float(sq.std()), reprojection_px=float(reproj.mean()),
+                offset_s=float(offset_s), sample_window_s=[float(times[0]), float(times[-1])],
+                warnings=warnings, ok=False, method='board (one position, shared lens)', focal_px=float(K[0, 0]))
+
+
 def save_board_calibration(path, res, video_a, video_b):
+    """Save a board calibration result to a .json file (the cameras plus the quality numbers and warnings).
+
+    Inputs: path - the .json file to write; res - the result of calibrate_board(); video_a, video_b - the two
+    calibration videos (their paths are stored in the file for reference).
+    Returns: nothing.
+    """
     ca, cb = res['cameras']
-    save_cameras(path, ca, cb, res['R'], res['t_cm'], 'cm', 'board',
+    save_cameras(path, ca, cb, res['R'], res['t_cm'], 'cm', res.get('method', 'board'),
                  dict(video_a=os.path.abspath(video_a), video_b=os.path.abspath(video_b),
+                      serial_a=vs.camera_serial(video_a), serial_b=vs.camera_serial(video_b),
                       **{k: res[k] for k in ('frames_a', 'frames_b', 'frames_both', 'lens_rms_px', 'stereo_rms_px',
                                              'distance_cm', 'square_mm', 'square_mean_mm', 'square_sd_mm',
                                              'reprojection_px', 'offset_s', 'sample_window_s', 'warnings')}))
 
 
 def board_report(res):
-    lines = [f"Board found in {res['frames_a']} frames of A, {res['frames_b']} of B, {res['frames_both']} of both.",
-             f"Lens fit error: A {res['lens_rms_px'][0]:.2f} px, B {res['lens_rms_px'][1]:.2f} px; "
-             f"stereo fit error {res['stereo_rms_px']:.2f} px.",
+    """A short readable text about a board calibration (shown to the user in the Lab App).
+
+    Input: res - the result of calibrate_board().
+    Returns: several lines of text: how many frames had the board, fit errors, distance between the cameras,
+    the size check of the squares, and PASS or the warnings.
+    """
+    lines = [f"Method: {res.get('method', 'board')}" + (f" ({', '.join(res['lens_from'])})" if res.get('lens_from') else '') + '.',
+             f"Board found in {res['frames_a']} frames of A, {res['frames_b']} of B, {res['frames_both']} of both."
+             + (f" {res['views_dropped']} view(s) left out (they fit far worse than the rest)." if res.get('views_dropped') else ''),
+             (f"Lens fit error: A {res['lens_rms_px'][0]:.2f} px, B {res['lens_rms_px'][1]:.2f} px; "
+              if not res.get('lens_from') else 'Lenses from an earlier calibration of the same cameras; ')
+             + f"stereo fit error {res['stereo_rms_px']:.2f} px.",
              f"Cameras are {res['distance_cm']:.1f} cm apart.",
              f"Check: squares measure {res['square_mean_mm']:.2f} ± {res['square_sd_mm']:.2f} mm "
              f"(entered {res['square_mm']:.1f} mm); mean reprojection error {res['reprojection_px']:.2f} px."]
@@ -545,50 +575,13 @@ def board_report(res):
     return '\n'.join(lines)
 
 
-def run_board(args):
-    offset = args.offset
-    if offset is None:
-        try:
-            import timecode
-            offset, ta, tb = timecode.timecode_offset(args.video_a, args.video_b)
-            print(f"Offset from the timecode: {offset:+.3f} s (A {ta['timecode']}, B {tb['timecode']})")
-        except Exception as e:
-            sys.exit(f'Could not read the timecodes ({e}) - give the offset with --offset.')
-    print('Looking for the board...')
-    res = calibrate_board(args.video_a, args.video_b, offset, args.square_mm, args.start, args.seconds,
-                          args.per_second, progress=lambda f, text='': print(f'\r  {f:.0%} {text}', end='', flush=True))
-    print()
-    print(board_report(res))
-    path = cameras_path(args.video_a, args.video_b)
-    save_board_calibration(path, res, args.video_a, args.video_b)
-
-
 def main():
-    parser = argparse.ArgumentParser(description='Find where two cameras are relative to each other.')
+    """Command line entry: `python calibrate_cameras.py make-board` saves the printable board."""
+    parser = argparse.ArgumentParser(description='Print the camera calibration board (the calibration itself is '
+                                                 'done in the Lab App).')
     sub = parser.add_subparsers(dest='mode', required=True)
     sub.add_parser('make-board', help='Save the printable calibration board')
-    pc = sub.add_parser('clicks', help='Click matching points in the first frames of both videos')
-    pc.add_argument('video_a')
-    pc.add_argument('video_b')
-    pc.add_argument('--focal-35mm', type=float, default=28,
-                    help='Lens focal length, 35 mm equivalent (phone main camera in 4K video: ~28)')
-    pc.add_argument('--known', nargs=3, metavar=('POINT', 'POINT', 'CM'),
-                    help='Two clicked points and their real distance in cm (gives real units)')
-    pc.add_argument('--again', action='store_true', help='Start the clicking over (forget the saved points)')
-    pc.add_argument('--edit', action='store_true', help='Open the saved points to add or undo points')
-    pc.add_argument('--drop', type=int, nargs='+', metavar='POINT', help='Remove these saved points')
-    pb = sub.add_parser('board', help='Find the printed board in both videos')
-    pb.add_argument('video_a')
-    pb.add_argument('video_b')
-    pb.add_argument('--square-mm', type=float, default=BOARD_SQUARE_MM, help='Measured size of one board square')
-    pb.add_argument('--per-second', type=float, default=4, help='Frames checked per second of video')
-    pb.add_argument('--start', type=float, default=0.0, help='Start looking N seconds into video A')
-    pb.add_argument('--seconds', type=float, default=60.0, help='Look for N seconds (0 = to the end)')
-    pb.add_argument('--offset', type=float, help='Seconds into video A at which video B started '
-                                                  '(default: from the GoPro timecodes)')
-    args = parser.parse_args()
-    {'make-board': run_make_board, 'clicks': run_clicks, 'board': run_board}[args.mode](args)
-
+    run_make_board(parser.parse_args())
 
 if __name__ == '__main__':
     main()

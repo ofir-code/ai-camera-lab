@@ -8,7 +8,16 @@ Port of loaddata.m + calculateMeasures.m + makeCSVsubject.m / makeCSVall.m:
     differentiated, and the tangential velocity is the speed
   - first peak = the first speed peak (> 30% of the maximum after the light came on) after the light came on
   - movement onset = the last sample between the light coming on and the first peak with speed < 5% of the
-    maximum (the light-on sample if there is none) -> reaction time (responsetime) = onset - light on
+    maximum (calculateMeasures.m). If the speed never drops below 5% there (the resting hand drifting slightly,
+    or the end of the return home) calculateMeasures.m fell back to the light-on sample, giving RT ~ 0; here the
+    same 5% rule is then measured from the resting level instead of from 0: the last sample with speed <= the
+    lowest speed between the light and the peak + 5% of the maximum -> reaction time (responsetime) = onset -
+    light on
+  - negative reaction times: if the reach toward the target already started before the light (the same < 5%
+    search, but looking back before the light, at most ANTICIPATION_MAX_S), that earlier sample is the onset
+    and the reaction time is negative (the subject knew the next light of the sequence). The data of each
+    trial include the home phase before the light for this (as loaddata.m: "so we can include negative onset
+    times").
   - movement end = the first sample after the first peak with speed < 5% of the maximum (the last sample if
     there is none) -> movement time = end - onset
   - also: straight-line deviation, number of speed peaks (> 10% of the maximum), acceleration time (AT),
@@ -16,7 +25,9 @@ Port of loaddata.m + calculateMeasures.m + makeCSVsubject.m / makeCSVall.m:
   - summaries: mean, median, SD and IQR by part, by block and by sequence, without familiarization, only
     the trials with touse = 1 (MATLAB's std and iqr: sample SD, 'hazen' percentiles)
 Flags (new):
-  - Anticipation: the movement toward the target started before the light came on (from the home position)
+  - Anticipation: the movement toward the target started before the light came on (negative reaction time)
+  - Not from home (shortcut): the movement didn't start at the home position (where the hand/foot rests when
+    the lights come on) but e.g. at the previous switch - with where it started
   - Corrected: the first movement went to another switch, then the right one was hit in time
 """
 import csv
@@ -32,24 +43,35 @@ MARKER = {'upper': {'right': 16, 'left': 15}, 'lower': {'right': 28, 'left': 27}
 MIN_VISIBILITY = 0.3
 ANTICIPATION_MIN_S = 0.03        # movement onset at least this much before the light -> anticipation
 ANTICIPATION_MAX_S = 0.5         # ... and at most this much (earlier = still the return to home, not a reach)
-HOME_ZONE = 0.3                  # ... and it started within 30% of the home-target distance from home
+TOWARD_COS = 0.7                 # 'toward the target' = moving within ~45 degrees of the direction to it
+HOME_ZONE = 0.5                  # started more than halfway from home toward the target = not from home (the
+                                 # resting position itself varies by up to ~40% of the reach)
+SWITCH_ZONE = 0.25               # ... and started 'at switch k' if within 25% of the reach from that switch
 CORRECTION_MIN_S = 0.15          # first movement stopped at least this long before the hit ...
 EXCLUDED_FROM_SUMMARY = ['Familiarization']
 SUMMARY_PARTS = ['pre_test', 'pre_test_contralateral', 'practice', 'post_test', 'post_test_contralateral',
                  're_test', 're_test_contralateral']
 MEASURES = ['responsetime', 'movementtime', 'straighlinedeviation', 'numpeaks', 'AT', 'DT', 'AT_over_DT',
-            'endpointdistance']
+            'endpointdistance', 'responsetime_jason', 'movementtime_jason']
+# responsetime_jason / movementtime_jason: exactly as calculateMeasures.m - the onset is searched only from the light
+# on (so never negative), and when the speed never drops below 5% the onset is the light-on sample (RT ~ 0). For
+# comparing with the previous system; responsetime / movementtime are the app's (negative RT when anticipated).
+REACH_CM = 12.0         # 3D: the hand / foot reached the switch when its closest point is this near the switch's
+                        # centre (checked against the light-switch system: at the press it is ~6-12 cm)
+REPRESS_S = 0.4          # hand/foot on the switch this long before the light went off -> pressed again? (usual ~0.1 s)
+OUTLIER_MAD = 3.5        # RT / MT further than this many (scaled) MADs from its limb's median -> unusual
 
 
 SPIKE_FRACTION = 0.03            # a point > 3% of the image size away from its neighbours' median is a glitch
 
 
-def marker_track(pose, limb, side, image_size=None):
-    """(frames, 2) marker position (NaN where MediaPipe isn't sure, or where it jumps for a single frame or two
-    - a glitch, not a movement: compared with the median of the 5 frames around it)."""
-    j = MARKER[limb][side]
+def marker_track(pose, limb, side, image_size=None, min_visibility=MIN_VISIBILITY, joint=None):
+    """(frames, 2) marker position (NaN where MediaPipe isn't sure - visibility below min_visibility - or where
+    it jumps for a single frame or two - a glitch, not a movement: compared with the median of the 5 frames
+    around it). joint: another MediaPipe point than the limb's marker (e.g. a toe)."""
+    j = MARKER[limb][side] if joint is None else joint
     xy = pose[:, j, :2].astype(float).copy()
-    xy[~(pose[:, j, 2] >= MIN_VISIBILITY)] = np.nan
+    xy[~(pose[:, j, 2] >= min_visibility)] = np.nan
     if image_size is not None and len(xy) >= 5:
         pad = np.pad(xy, ((2, 2), (0, 0)), mode='edge')
         with warnings.catch_warnings():   # all-NaN stretches (marker not seen) are expected
@@ -85,22 +107,47 @@ def trial_kinematics(t_s, pos, stim_s):
 
 
 def calculate_measures(k, target_pos, home_pos=None):
-    """calculateMeasures.m for one trial (k = trial_kinematics output). Returns measures + plot samples."""
+    """calculateMeasures.m for one trial (k = trial_kinematics output), with negative reaction times when the
+    reach started before the light. Returns measures + plot samples."""
     nan = dict.fromkeys(MEASURES, np.nan)
+    empty = dict(nan, onset_s=np.nan, end_s=np.nan, anticipation=False, anticipation_ms=None, start_pos=None)
     if k is None:
-        return dict(nan, onset_s=np.nan, end_s=np.nan, anticipation=False, anticipation_ms=None)
+        return empty
     time, xyz, tv, stim = k['time'], k['xyz'], k['tangvel'], k['stim']
     s = int(np.searchsorted(time, stim))   # MATLAB: find(time >= stimulusonsettime, 1)
     if s >= len(time) - 1:
-        return dict(nan, onset_s=np.nan, end_s=np.nan, anticipation=False, anticipation_ms=None)
+        return empty
     maxtv = tv[s:].max()
     peaks, _ = find_peaks(tv, height=0.3 * maxtv)
     after = peaks[time[peaks] >= stim]
     if maxtv <= 0 or len(after) == 0:
-        return dict(nan, onset_s=np.nan, end_s=np.nan, anticipation=False, anticipation_ms=None)
+        return empty
     first = int(after[0])
-    below = np.nonzero(tv[s:first + 1] < 0.05 * maxtv)[0]
-    onset = s + int(below[-1]) if len(below) else s
+    seg_tv = tv[s:first + 1]
+    below = np.nonzero(seg_tv < 0.05 * maxtv)[0]
+    jason_onset = s + int(below[-1]) if len(below) else s         # calculateMeasures.m as it is
+    if len(below):
+        onset = s + int(below[-1])                                   # calculateMeasures.m
+    else:                                                            # never < 5%: 5% above the resting level
+        onset = s + int(np.nonzero(seg_tv <= seg_tv.min() + 0.05 * maxtv)[0][-1])
+    # Start of the rise into the first peak (back from the peak while the speed keeps falling, until < 5%) -
+    # only to tell whether the reach began before the light (a slow drift is not a rise)
+    rise = first
+    while rise > 0 and tv[rise - 1] < tv[rise] and tv[rise] >= 0.05 * maxtv:
+        rise -= 1
+    # Started before the light? It counts if the rise began at most ANTICIPATION_MAX_S before the light and the
+    # hand/foot was then moving toward the target (not e.g. still returning home from the previous trial); then
+    # the onset is that earlier moment and the reaction time is negative.
+    anticipation = False
+    lead = stim - time[rise]
+    if ANTICIPATION_MIN_S < lead <= ANTICIPATION_MAX_S and target_pos is not None:
+        v = k['vel'][s]
+        to_target = np.asarray(target_pos, float) - xyz[s]
+        nv, nt = np.linalg.norm(v), np.linalg.norm(to_target)
+        if nv > 0.05 * maxtv and nt > 0 and np.dot(v, to_target) / (nv * nt) > TOWARD_COS:
+            anticipation = True
+            onset = rise
+
     below = np.nonzero(tv[first:] < 0.05 * maxtv)[0]
     end = first + int(below[0]) if len(below) else len(time) - 1
     rng = slice(onset, end + 1)
@@ -108,31 +155,38 @@ def calculate_measures(k, target_pos, home_pos=None):
     m = dict(responsetime=time[onset] - stim, movementtime=time[end] - time[onset],
              straighlinedeviation=float(np.mean(_point_line_distance(seg, seg[0], seg[-1]))),
              numpeaks=len(find_peaks(tv[rng], height=0.1 * tv.max())[0]),
-             AT=time[first] - time[onset], DT=time[end] - time[first])
+             AT=time[first] - time[onset], DT=time[end] - time[first],
+             responsetime_jason=time[jason_onset] - stim, movementtime_jason=time[end] - time[jason_onset])
     m['AT_over_DT'] = m['AT'] / m['DT'] if m['DT'] > 0 else np.nan
     m['endpointdistance'] = float(np.linalg.norm(seg[-1] - target_pos)) if target_pos is not None else np.nan
-    m.update(onset_s=time[onset], end_s=time[end], peak_s=time[first])
-
-    # Anticipation: the same onset search, but not stopped at the light: did the movement that peaks first
-    # after the light start before it, from the home position, toward the target?
-    below = np.nonzero(tv[:first + 1] < 0.05 * maxtv)[0]
-    free_onset = int(below[-1]) if len(below) else 0
-    m['anticipation'], m['anticipation_ms'] = False, None
-    lead = stim - time[free_onset]
-    if ANTICIPATION_MIN_S < lead <= ANTICIPATION_MAX_S and home_pos is not None and target_pos is not None:
-        u = np.asarray(target_pos) - home_pos
-        dist = np.linalg.norm(u)
-        if dist > 0:
-            u = u / dist
-            near_home = np.linalg.norm(xyz[free_onset] - home_pos) < HOME_ZONE * dist
-            toward = np.dot(k['vel'][s], u) > 0
-            if near_home and toward:
-                m['anticipation'] = True
-                m['anticipation_ms'] = round((stim - time[free_onset]) * 1000, 1)
+    m.update(onset_s=time[onset], end_s=time[end], peak_s=time[first], start_pos=xyz[onset],
+             anticipation=anticipation, anticipation_ms=round(lead * 1000, 1) if anticipation else None)
     return m
 
 
+def start_place(start, home, target_pos, switch_pos):
+    """Where the movement started: ('home' | 'switch k' | 'elsewhere', distance from home in % of the
+    home-target distance)."""
+    if start is None or home is None or target_pos is None:
+        return '', None
+    reach = np.linalg.norm(np.asarray(target_pos) - home)
+    if reach <= 0:
+        return '', None
+    d = np.linalg.norm(start - home) / reach
+    if d <= HOME_ZONE:
+        return 'home', round(100 * d)
+    to_sw = np.linalg.norm(np.asarray(switch_pos) - start, axis=1) / reach
+    k = int(np.argmin(to_sw))
+    return (f'switch {k + 1}' if to_sw[k] <= SWITCH_ZONE else 'elsewhere'), round(100 * d)
+
+
 def nearest_switch(p, switch_pos, switch_size):
+    """Which switch a point is nearest to.
+
+    Inputs: p - a position (x, y or x, y, z); switch_pos - the switches' positions; switch_size - a switch's size
+    (distances are measured in switch sizes).
+    Returns: the switch number (1, 2, 3 ...).
+    """
     d = np.linalg.norm(switch_pos - p, axis=1) / switch_size
     return int(np.argmin(d)) + 1
 
@@ -150,13 +204,21 @@ def corrected_reach(k, m, hit_s, target, switch_pos, switch_size):
 
 
 def _homes(trials, track):
-    """Home position per limb/side: where the marker is when the lights come on (median over trials)."""
+    """Home position per block and limb/side: where the marker is when the lights come on in that block (median
+    over its trials) - the resting position can shift a little between blocks / parts."""
     homes = {}
-    for key, tr in track.items():
-        on = [r['on_frame'] for r in trials if r['on_frame'] and (r['Limb'], r['Side']) == key]
-        pts = tr[on] if on else np.empty((0, tr.shape[1]))
+    groups = {}
+    for r in trials:
+        if r.get('on_frame'):
+            groups.setdefault((r.get('block_index'), r['Limb'], r['Side']), []).append(r['on_frame'])
+    for (bi, limb, side), frames in groups.items():
+        tr = track.get((limb, side))
+        if tr is None:
+            continue
+        pts = tr[frames]
         pts = pts[~np.isnan(pts[:, 0])]
-        homes[key] = np.median(pts, axis=0) if len(pts) else None
+        if len(pts) >= 5:
+            homes[(bi, limb, side)] = np.median(pts, axis=0)
     return homes
 
 
@@ -170,7 +232,7 @@ def measure_trials(trials, times_ms, sources):
     homes = [_homes(trials, src['track']) for src in sources]
     for r in trials:
         r.update(dict.fromkeys(MEASURES, np.nan), anticipation=False, anticipation_ms=None, corrected_from=None,
-                 touse=r['Outcome'] == 'hit', Data='')
+                 touse=r['Outcome'] == 'hit', Data='', start_from='', start_dist_pct=None)
         if r['on_frame'] is None or r.get('off_frame') is None:
             r['touse'] = False
             continue
@@ -184,7 +246,7 @@ def measure_trials(trials, times_ms, sources):
                 continue
             src = sources[i]
             k = trial_kinematics(t_s[a:b + 1], src['track'][key][a:b + 1], t_s[r['on_frame']])
-            m = calculate_measures(k, src['switch_pos'][r['Target'] - 1], homes[i].get(key))
+            m = calculate_measures(k, src['switch_pos'][r['Target'] - 1], homes[i].get((r.get('block_index'),) + key))
             if not np.isnan(m['responsetime']):
                 r['Data'] = src['name']
                 break
@@ -196,9 +258,65 @@ def measure_trials(trials, times_ms, sources):
         r.update({x: m.get(x, np.nan) for x in MEASURES})
         r['anticipation'], r['anticipation_ms'] = m['anticipation'], m['anticipation_ms']
         r['onset_s'], r['end_s'] = m.get('onset_s'), m.get('end_s')
+        r['start_from'], r['start_dist_pct'] = start_place(m.get('start_pos'), homes[i].get((r.get('block_index'),) + key),
+                                                           src['switch_pos'][r['Target'] - 1], src['switch_pos'])
         if r['Outcome'] == 'hit':
             r['corrected_from'] = corrected_reach(k, m, t_s[r['off_frame']], r['Target'], src['switch_pos'],
                                                   src['switch_size'])
+    review_trials(trials)
+    return trials
+
+
+def review_trials(trials):
+    """Flags for data cleaning (in place): Repress, Clean, and a recommendation ('exclude' / 'check' / '') with
+    its reasons. Nothing is left out automatically - touse stays as it was; the recommendation is for the user.
+      exclude: no press in time (miss), trial not found, no movement data, corrected (went to another switch)
+      check:   pressed again? (on the switch >= REPRESS_S before the light went off), not from home, RT or MT
+               unusual for that limb (> OUTLIER_MAD scaled MADs from its median)
+    Clean = a hit with movement data, not corrected, not pressed again, started from home."""
+    usual = {}
+    groups = {}
+    for r in trials:
+        if r['Outcome'] == 'hit' and r.get('Data'):
+            groups.setdefault((r['Limb'], r['Side']), []).append(r)
+    for key, rows in groups.items():
+        for m in ('responsetime', 'movementtime'):
+            x = np.array([r[m] for r in rows], float)
+            x = x[~np.isnan(x)]
+            if len(x) >= 10:
+                med = np.median(x)
+                usual[key + (m,)] = (med, max(1.4826 * np.median(np.abs(x - med)), 0.02))
+    for r in trials:
+        exclude, check = [], []
+        out = r['Outcome']
+        if out == 'miss':
+            exclude.append('miss: no press in time (the light went off by itself)')
+        elif out == 'not detected':
+            exclude.append('trial not found in the video')
+        elif out != 'hit':
+            exclude.append(f'outcome {out}')
+        elif not r.get('Data'):
+            exclude.append('no movement data (the hand/foot was not seen)')
+        if r.get('corrected_from'):
+            exclude.append(f"went to switch {r['corrected_from']} first, then corrected")
+        gap = None
+        if out == 'hit' and r.get('Touch_ms') is not None and r.get('Hit_ms') is not None:
+            gap = (r['Hit_ms'] - r['Touch_ms']) / 1000
+        r['touch_to_hit_s'] = gap
+        r['repress'] = gap is not None and gap >= REPRESS_S
+        if r['repress']:
+            check.append(f'on the switch {gap:.2f} s before the light went off - pressed again?')
+        if r.get('start_from') not in ('', 'home', None):
+            check.append(f"started from {r['start_from']}, not from home")
+        for m, name in (('responsetime', 'RT'), ('movementtime', 'MT')):
+            u = usual.get((r['Limb'], r['Side'], m))
+            v = r.get(m)
+            if u and v is not None and not np.isnan(v) and abs(v - u[0]) > OUTLIER_MAD * u[1]:
+                check.append(f'{name} {v:.3f} s is unusual for this limb (median {u[0]:.3f} s)')
+        r['Clean'] = (out == 'hit' and bool(r.get('Data')) and not r.get('corrected_from') and not r['repress']
+                      and r.get('start_from') in ('', 'home', None))
+        r['Recommendation'] = 'exclude' if exclude else 'check' if check else ''
+        r['Reasons'] = '; '.join(exclude + check)
     return trials
 
 
@@ -207,10 +325,18 @@ def measure_trials(trials, times_ms, sources):
 # -----------------------------
 TRIAL_COLUMNS = ['Part', 'Block', 'Sequence', 'Trial', 'Target', 'Limb', 'Side', 'Light_on_ms', 'Touch_ms',
                  'Hit_ms', 'Light_off_ms', 'Trial_end_ms', 'Outcome', 'Light_source', 'Anticipation',
-                 'Anticipation_ms', 'Corrected', 'Corrected_from']
+                 'Anticipation_ms', 'Not_from_home', 'Started_from', 'Start_distance_pct', 'Corrected',
+                 'Corrected_from', 'RT_s', 'MT_s', 'Repress', 'Touch_to_hit_s', 'Clean', 'Recommendation',
+                 'Reasons', 'RT_jason_s', 'MT_jason_s', 'touse', 'System_ms', 'Touch_from']
 
 
 def _cell(v):
+    """Make one value ready for a spreadsheet cell.
+
+    Input: v - any value (number, True/False, text, None).
+    Returns: '' for missing values (None / NaN), 1/0 for True/False, numbers rounded to 4 decimals, anything else
+    unchanged.
+    """
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return ''
     if isinstance(v, (bool, np.bool_)):
@@ -230,10 +356,21 @@ def write_trials_csv(path, trials):
         for r in trials:
             w.writerow([_cell(r.get(c)) for c in TRIAL_COLUMNS[:14]] +
                        [_cell(r.get('anticipation')), _cell(r.get('anticipation_ms')),
-                        int(r.get('corrected_from') is not None), _cell(r.get('corrected_from'))])
+                        int(r.get('start_from') not in ('', 'home')), r.get('start_from', ''),
+                        _cell(r.get('start_dist_pct')),
+                        int(r.get('corrected_from') is not None), _cell(r.get('corrected_from')),
+                        _cell(r.get('responsetime')), _cell(r.get('movementtime')),
+                        _cell(r.get('repress')), _cell(r.get('touch_to_hit_s')), _cell(r.get('Clean')),
+                        r.get('Recommendation', ''), r.get('Reasons', ''),
+                        _cell(r.get('responsetime_jason')), _cell(r.get('movementtime_jason')),
+                        _cell(r.get('touse')), _cell(r.get('System_ms')), r.get('Touch_from', '')])
 
 
 def _iqr(x):
+    """The interquartile range (75th percentile minus 25th percentile), computed the same way as MATLAB's iqr.
+
+    Input: x - a list/array of numbers. Returns: the IQR, or NaN if x is empty.
+    """
     return np.percentile(x, 75, method='hazen') - np.percentile(x, 25, method='hazen') if len(x) else np.nan
 
 
@@ -271,15 +408,26 @@ def summary_tables(rows_by_subject):
 
 MEASURE_COLUMNS = (['Subject', 'Session', 'Part', 'Block', 'Sequence', 'Trial', 'Target', 'Outcome', 'Light_source',
                     'Anticipation',
-                    'Anticipation_ms', 'Corrected', 'Corrected_from', 'Data'] + MEASURES + ['touse'])
+                    'Anticipation_ms', 'Not_from_home', 'Started_from', 'Start_distance_pct', 'Corrected',
+                    'Corrected_from', 'Repress', 'Clean', 'Recommendation', 'Reasons', 'Data'] + MEASURES + ['touse'])
 
 
 def measure_row(subject, session, r):
+    """One row of the 'measures' sheet for one trial.
+
+    Inputs: subject - the subject's name/code; session - the session name; r - the trial row (from
+    measure_trials()).
+    Returns: a dict with the MEASURE_COLUMNS (part, block, trial, outcome, flags, all the measures, touse).
+    """
     return {'Subject': subject, 'Session': session, 'Part': r['Part'], 'Block': r['Block'],
             'Sequence': r['Sequence'], 'Trial': r['Trial'], 'Target': r['Target'], 'Outcome': r['Outcome'],
             'Light_source': r.get('Light_source', ''),
             'Anticipation': bool(r.get('anticipation')), 'Anticipation_ms': r.get('anticipation_ms'),
+            'Not_from_home': r.get('start_from') not in ('', 'home', None), 'Started_from': r.get('start_from', ''),
+            'Start_distance_pct': r.get('start_dist_pct'),
             'Corrected': r.get('corrected_from') is not None, 'Corrected_from': r.get('corrected_from'),
+            'Repress': bool(r.get('repress')), 'Clean': bool(r.get('Clean')),
+            'Recommendation': r.get('Recommendation', ''), 'Reasons': r.get('Reasons', ''),
             'Data': r.get('Data', ''),
             **{m: r.get(m, np.nan) for m in MEASURES}, 'touse': bool(r.get('touse'))}
 
