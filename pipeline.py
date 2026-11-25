@@ -677,7 +677,41 @@ def step_processing(st, progress, should_stop, results_dir=None):
             details.append(f'! Camera {c.upper()}: frames missing where the parallel parts meet ({len(gaps)} places) '
                            '- run with LAB_WORKERS=1 to avoid it.')
             status = STATUS_WARN
+    details += check_sync(st)
     return status, f'Every frame processed ({st.get("pose_model", "full")} pose model).', details
+
+
+def check_sync(st):
+    """After processing: line the two videos up again from the switch lights both cameras saw come on (the
+    timecodes can leave them a frame or two apart, which shifts 3D positions during fast movements). If the
+    offset changes, a calibration made from the session videos runs again (it pairs the cameras' frames).
+    Returns detail lines."""
+    if not st.get('cam_b') or st.get('offset_source') == 'manual':
+        return []
+    sync = sa.sync_from_lights(st)
+    if sync is None:
+        return ['Sync not checked: too few lights seen by both cameras.']
+    corr, n, share = sync
+    fps = 50.0
+    try:
+        import session_engine as se
+        cache = se.load_cache(st['cam_a'], day_dir(st['subject'], st['session']))
+        fps = cache['meta']['fps'] if cache is not None else fps
+    except Exception:
+        pass
+    if share < sa.SYNC_AGREE:
+        return [f'! Sync not changed: the {n} lights both cameras saw do not agree on one offset '
+                f'({share:.0%} within a frame).']
+    if abs(corr) < 0.5 / fps:
+        return [f'Sync checked with {n} lights both cameras saw: within one frame.']
+    st['offset_s'] = round(st.get('offset_s', 0.0) + corr, 4)
+    st['offset_source'] = 'timecode + lights'
+    out = [f'Videos lined up again from {n} lights both cameras saw: camera B moved by {corr * 1000:+.0f} ms '
+           f'(the timecodes left them {abs(corr) * 1000:.0f} ms apart).']
+    if st.get('calibration_source', 'auto') == 'auto' and st['steps']['calibration']['status'] in DONE:
+        mark_todo(st, 'calibration')
+        out.append('The calibration runs again with the corrected sync.')
+    return out
 
 
 def step_analysis(st, progress, should_stop, results_dir=None):
@@ -743,6 +777,18 @@ def run_day(pid, day, progress=None, should_stop=None, on_change=None, results_d
     on_change = on_change or (lambda st: None)
     st = load_day(pid, day, results_dir)
     _apply_participant(st, load_participant(pid, results_dir))
+    for _pass in range(2):      # a second pass when a step was set back to do (calibration after a sync fix)
+        if _pass and not any(st['steps'][x]['status'] == STATUS_TODO for x in STEPS):
+            break
+        st = _run_steps(st, steps, progress, should_stop, on_change, results_dir)
+        if st.get('_stopped'):
+            st.pop('_stopped')
+            return st
+    return st
+
+
+def _run_steps(st, steps, progress, should_stop, on_change, results_dir):
+    """One pass over the steps (see run_day)."""
     session = None
     for step in STEPS:
         if steps is not None and step not in steps:
@@ -780,6 +826,7 @@ def run_day(pid, day, progress=None, should_stop=None, on_change=None, results_d
             set_status(st, step, STATUS_TODO, 'Stopped.')
             save_day(st, results_dir)
             on_change(st)
+            st['_stopped'] = True
             return st
         except Exception as e:
             traceback.print_exc()
@@ -787,11 +834,15 @@ def run_day(pid, day, progress=None, should_stop=None, on_change=None, results_d
                        str(e).splitlines()[1:])
             save_day(st, results_dir)
             on_change(st)
+            st['_stopped'] = True
             return st
         save_day(st, results_dir)
         on_change(st)
         if should_stop():
+            st['_stopped'] = True
             return st
+        if any(st['steps'][x]['status'] == STATUS_TODO for x in STEPS[:STEPS.index(step)]):
+            return st                       # an earlier step was set back (sync fix): next pass from there
     return st
 
 

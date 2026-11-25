@@ -92,6 +92,37 @@ def settings_of(state):
     return ed.Settings(**state['settings'])
 
 
+SYNC_MIN_LIGHTS = 20      # lights seen by both cameras needed to check the sync
+SYNC_AGREE = 0.7          # ... of which this share must agree within one frame
+
+
+def light_sync(on_a, on_b, fps):
+    """How far camera B's timeline is off from camera A's, from switch lights both cameras saw come on: a light
+    comes on at one moment, so the median gap between its two light-on times is the sync error the timecodes left.
+    on_a / on_b: [(switch, light-on ms on the session timeline)]. Returns (correction_s - add it to offset_s,
+    lights used, share within one frame of the median) or None (too few lights)."""
+    d = []
+    for sw, ta in on_a:
+        near = [tb - ta for s, tb in on_b if s == sw and abs(tb - ta) < 150]
+        if near:
+            d.append(min(near, key=abs))
+    if len(d) < SYNC_MIN_LIGHTS:
+        return None
+    d = np.array(d)
+    med = float(np.median(d))
+    return -med / 1000, len(d), float(np.mean(np.abs(d - med) <= 1000 / fps))
+
+
+def sync_from_lights(state):
+    """light_sync() for a session whose videos are processed (both cameras), or None."""
+    s = Session(state)
+    if len(s.cams) < 2:
+        return None
+    on = {c: [(sw, float(s.cam_times[c][f])) for sw, f, _ in ed.light_events(cache['light'], cache['meta']['fps']) if f > 0]
+          for c, cache in s.cams.items()}
+    return light_sync(on['a'], on['b'], s.fps)
+
+
 def trial_key(r):
     """A short text that names one trial, e.g. 'pre_test|2|3|5' (part | block | sequence | trial).
     Used to remember the user's "use this trial" choices.
