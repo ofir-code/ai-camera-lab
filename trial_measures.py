@@ -56,6 +56,8 @@ MEASURES = ['responsetime', 'movementtime', 'straighlinedeviation', 'numpeaks', 
 # responsetime_jason / movementtime_jason: exactly as calculateMeasures.m - the onset is searched only from the light
 # on (so never negative), and when the speed never drops below 5% the onset is the light-on sample (RT ~ 0). For
 # comparing with the previous system; responsetime / movementtime are the app's (negative RT when anticipated).
+REACH_CM = 12.0         # 3D: the hand / foot reached the switch when its closest point is this near the switch's
+                        # centre (checked against the light-switch system: at the press it is ~6-12 cm)
 REPRESS_S = 0.4          # hand/foot on the switch this long before the light went off -> pressed again? (usual ~0.1 s)
 OUTLIER_MAD = 3.5        # RT / MT further than this many (scaled) MADs from its limb's median -> unusual
 
@@ -63,11 +65,11 @@ OUTLIER_MAD = 3.5        # RT / MT further than this many (scaled) MADs from its
 SPIKE_FRACTION = 0.03            # a point > 3% of the image size away from its neighbours' median is a glitch
 
 
-def marker_track(pose, limb, side, image_size=None, min_visibility=MIN_VISIBILITY):
+def marker_track(pose, limb, side, image_size=None, min_visibility=MIN_VISIBILITY, joint=None):
     """(frames, 2) marker position (NaN where MediaPipe isn't sure - visibility below min_visibility - or where
     it jumps for a single frame or two - a glitch, not a movement: compared with the median of the 5 frames
-    around it)."""
-    j = MARKER[limb][side]
+    around it). joint: another MediaPipe point than the limb's marker (e.g. a toe)."""
+    j = MARKER[limb][side] if joint is None else joint
     xy = pose[:, j, :2].astype(float).copy()
     xy[~(pose[:, j, 2] >= min_visibility)] = np.nan
     if image_size is not None and len(xy) >= 5:
@@ -325,7 +327,7 @@ TRIAL_COLUMNS = ['Part', 'Block', 'Sequence', 'Trial', 'Target', 'Limb', 'Side',
                  'Hit_ms', 'Light_off_ms', 'Trial_end_ms', 'Outcome', 'Light_source', 'Anticipation',
                  'Anticipation_ms', 'Not_from_home', 'Started_from', 'Start_distance_pct', 'Corrected',
                  'Corrected_from', 'RT_s', 'MT_s', 'Repress', 'Touch_to_hit_s', 'Clean', 'Recommendation',
-                 'Reasons', 'RT_jason_s', 'MT_jason_s', 'touse', 'System_ms']
+                 'Reasons', 'RT_jason_s', 'MT_jason_s', 'touse', 'System_ms', 'Touch_from']
 
 
 def _cell(v):
@@ -361,7 +363,7 @@ def write_trials_csv(path, trials):
                         _cell(r.get('repress')), _cell(r.get('touch_to_hit_s')), _cell(r.get('Clean')),
                         r.get('Recommendation', ''), r.get('Reasons', ''),
                         _cell(r.get('responsetime_jason')), _cell(r.get('movementtime_jason')),
-                        _cell(r.get('touse')), _cell(r.get('System_ms'))])
+                        _cell(r.get('touse')), _cell(r.get('System_ms')), r.get('Touch_from', '')])
 
 
 def _iqr(x):

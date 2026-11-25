@@ -12,6 +12,7 @@ Outputs in the session folder:
 """
 import json
 import os
+import warnings
 from dataclasses import asdict
 
 import numpy as np
@@ -181,10 +182,11 @@ class Session:
         out[ok] = arr[i[ok]]
         return out
 
-    def track_2d(self, c, key, min_visibility=tm.MIN_VISIBILITY):
-        """Marker of camera c on the session timeline, in that camera's first-frame image coordinates."""
+    def track_2d(self, c, key, min_visibility=tm.MIN_VISIBILITY, joint=None):
+        """Marker of camera c on the session timeline, in that camera's first-frame image coordinates (joint:
+        another MediaPipe point than the marker)."""
         cache = self.cams[c]
-        xy = tm.marker_track(cache['pose'], *key, cache['meta']['size'], min_visibility)
+        xy = tm.marker_track(cache['pose'], *key, cache['meta']['size'], min_visibility, joint)
         xy = ek.to_first_frame(xy, cache['motion'][:len(xy)])
         return self.per_frame(c, xy)
 
@@ -258,6 +260,11 @@ class Session:
             sources.insert(0, dict(name='3D', cam=None, switch_pos=tri(sa_['switch_pos'], sb_['switch_pos']),
                                    switch_size=np.ones(len(sa_['switch_pos'])), track=track3))
             units = f'3D, {cal_units} (trials marked camera A/B: px of that camera)'
+            n3 = self.reach_3d(res['trials'], sources[0]['switch_pos'], ca, cb, track_3d, cal_units)
+            if n3 is not None:
+                res['warnings'].append(f'Reaching the switch measured in 3D in {n3[0]} of {n3[1]} trials '
+                                       f'(hand / foot within {tm.REACH_CM:.0f} cm of the switch; the others from the '
+                                       'camera image).')
         tm.measure_trials(res['trials'], self.times, sources)
         self.sources = {src['name']: src for src in sources}
         detected = [r for r in res['trials'] if r['on_frame'] is not None and r.get('off_frame') is not None]
@@ -275,6 +282,46 @@ class Session:
         self.switch_pos = sources[0]['switch_pos']
         self.result = res
         return res
+
+    def reach_3d(self, trials, switch_pos, ca, cb, track_3d, units):
+        """When the hand / foot reached the target switch, in 3D (Touch_ms): the first moment after the light
+        that the closest hand point (wrist, fingers) or foot point (ankle, heel, toe) is within tm.REACH_CM of
+        the switch. In the flat camera image a foot above a switch already looks 'on' it; in 3D it doesn't.
+        Trials without a 3D reach keep the camera image's touch. Returns (trials measured in 3D, trials) or None."""
+        if units != 'cm':
+            return None
+        dist = {}
+        for limb in ('upper', 'lower'):
+            for side in ('left', 'right'):
+                if not any(r['Limb'] == limb and r['Side'] == side for r in trials):
+                    continue
+                pts = []
+                for j in ek.LIMBS[limb]['touch_points'][side]:
+                    key = (limb, side)
+                    X, _ = track_3d(self.track_2d('a', key, joint=j), self.track_2d('b', key, joint=j),
+                                    self.track_2d('a', key, 0.0, joint=j), self.track_2d('b', key, 0.0, joint=j), ca, cb)
+                    pts.append(X)
+                P = np.stack(pts)                                            # points x frames x 3
+                with np.errstate(invalid='ignore'), warnings.catch_warnings():
+                    warnings.simplefilter('ignore', RuntimeWarning)     # all-NaN frames: the limb not seen in 3D
+                    dist[(limb, side)] = np.stack([np.nanmin(np.linalg.norm(P - p, axis=2), axis=0)
+                                                   for p in switch_pos])   # switches x frames
+        n = len(self.times)
+        done = total = 0
+        for r in trials:
+            r['Touch_from'] = 'image' if r.get('Touch_ms') is not None else ''
+            if r.get('on_frame') is None or (r['Limb'], r['Side']) not in dist:
+                continue
+            total += 1
+            end = n if r.get('off_frame') is None else min(n, r['off_frame'] + 2)
+            d = dist[(r['Limb'], r['Side'])][r['Target'] - 1, r['on_frame']:end]
+            with np.errstate(invalid='ignore'):
+                hit = np.nonzero(d <= tm.REACH_CM)[0]
+            if len(hit):
+                r['Touch_ms'] = round(float(self.times[r['on_frame'] + int(hit[0])]), 1)
+                r['Touch_from'] = '3D'
+                done += 1
+        return done, total
 
     def trial_curves(self, r):
         """Kinematics of one trial for the graphs: dict(time, xyz, tangvel, stim) + measures (or None)."""
